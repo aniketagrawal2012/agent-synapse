@@ -58,7 +58,7 @@ Speculative Tool Prefetching, Model Context Protocol (FastMCP), Logit Lens, Spli
 \section{Introduction}
 \label{sec:intro}
 
-The transition of Large Language Models (LLMs) from passive conversational interfaces to autonomous, tool-augmented enterprise agents has fundamentally altered the systems bottleneck of production AI infrastructure~\cite{yao2023react, schick2023toolformer, qin2024toolllm, patil2024gorilla, gemini2025report}. In enterprise cloud deployments---spanning financial crime graph investigation on Google Cloud Spanner Graph~\cite{corbett2012spanner, iso2024gql}, petabyte-scale analytical warehouse aggregation on BigQuery Dremel~\cite{melnik2010dremel}, grounded regulatory retrieval on Vertex AI Search, and transactional ERP orchestration via the Model Context Protocol (MCP)~\cite{anthropic2024mcp, wang2025mcpbench, lumer2025scalemcp, gan2025ragmcp}---a single user request routinely triggers $3$ to $12$ sequential tool-calling turns. While hardware accelerator architects have achieved extraordinary gains in raw matrix-multiply throughput and High-Bandwidth Memory (HBM) bandwidth on sixth-generation Google Cloud TPU v6e (Trillium)~\cite{jouppi2023tpuv4} and NVIDIA Blackwell B200 GPUs~\cite{hennessy2019new}, end-to-end agentic wall-clock latency remains dominated by a structural serialization bottleneck at the boundary between neural token decoding and external network I/O.
+The transition of Large Language Models (LLMs) from passive conversational interfaces to autonomous, tool-augmented enterprise agents has fundamentally altered the systems bottleneck of production AI infrastructure~\cite{yao2023react, schick2023toolformer, qin2024toolllm, patil2024gorilla, gemini2025report}. In enterprise cloud deployments---spanning financial crime graph investigation on Google Cloud Spanner Graph~\cite{corbett2012spanner, iso2024gql}, petabyte-scale analytical warehouse aggregation on BigQuery Dremel~\cite{melnik2010dremel}, grounded regulatory retrieval on Vertex AI Search, and transactional ERP orchestration via the Model Context Protocol (MCP)~\cite{anthropic2024mcp, wang2025mcpbench, lumer2025scalemcp, gan2025ragmcp}---a single user request routinely triggers $3$ to $12$ sequential tool-calling turns. While hardware accelerator architects have achieved extraordinary gains in raw matrix-multiply throughput and High-Bandwidth Memory (HBM) bandwidth on sixth-generation Google Cloud TPU v6e (Trillium)~\cite{google2024trillium} and NVIDIA Blackwell B200 GPUs~\cite{nvidia2024blackwell}, end-to-end agentic wall-clock latency remains dominated by a structural serialization bottleneck at the boundary between neural token decoding and external network I/O.
 
 \subsection{The Serial Decode-to-I/O Stall in Agentic Serving}
 Under the standard autoregressive tool-calling lifecycle implemented by contemporary agent frameworks (e.g., ReAct~\cite{yao2023react}, ToolLLM~\cite{qin2024toolllm}, vLLM~\cite{kwon2023efficient}, SGLang~\cite{zheng2024sglang}, and FastMCP~\cite{anthropic2024mcp}), each tool invocation turn executes as a strictly sequential two-phase barrier:
@@ -208,8 +208,8 @@ Crucially, even before $\mathbf{y}_{\text{req\_args}}$ is fully spelled out at l
 \subsection{Heterogeneous AI Accelerator Memory Hierarchy: Cloud TPU v6e and NVIDIA B200}
 Modern AI accelerators feature a steep two-tier on-package memory hierarchy separating high-capacity off-die High-Bandwidth Memory (HBM3/HBM3e) from ultra-low-latency on-die Static RAM (SRAM):
 \begin{itemize}
-    \item \textbf{Google Cloud TPU v6e (Trillium)~\cite{jouppi2023tpuv4, google2024trillium}:} Each TPU v6e chip couples Matrix Multiply Units (MXUs, operating on $256 \times 256$ systolic arrays) and Vector Processing Units (VPUs) with $32\text{ GB}$ of HBM ($1.60\text{ TB/s}$ bandwidth) and $128\text{ MB}$ of on-chip Vector/Common Memory SRAM (VMEM/CMEM) accessible via sub-microsecond Direct Memory Access (DMA) descriptor tables and scalar core registers.
-    \item \textbf{NVIDIA Blackwell B200~\cite{hennessy2019new, nvidia2024blackwell}:} Each B200 GPU pairs fifth-generation Tensor Cores with $192\text{ GB}$ of HBM3e ($8.00\text{ TB/s}$ bandwidth) and $256\text{ MB}$ of combined L2 cache, shared memory (SMEM), and dedicated Tensor Memory (TMEM) on-chip SRAM managed via hardware Tensor Memory Accelerator (TMA) descriptors.
+    \item \textbf{Google Cloud TPU v6e (Trillium)~\cite{google2024trillium}:} Each TPU v6e chip couples Matrix Multiply Units (MXUs, operating on $256 \times 256$ systolic arrays) and Vector Processing Units (VPUs) with $32\text{ GB}$ of HBM ($1.60\text{ TB/s}$ bandwidth) and $128\text{ MB}$ of on-chip Vector/Common Memory SRAM (VMEM/CMEM) accessible via sub-microsecond Direct Memory Access (DMA) descriptor tables and scalar core registers.
+    \item \textbf{NVIDIA Blackwell B200~\cite{nvidia2024blackwell}:} Each B200 GPU pairs fifth-generation Tensor Cores with $192\text{ GB}$ of HBM3e ($8.00\text{ TB/s}$ bandwidth) and $256\text{ MB}$ of combined L2 cache, shared memory (SMEM), and dedicated Tensor Memory (TMEM) on-chip SRAM managed via hardware Tensor Memory Accelerator (TMA) descriptors.
 \end{itemize}
 
 \begin{table}[t]
@@ -284,30 +284,28 @@ $}
 
 \begin{lemma}[Information-Theoretic Lower Bound on Dominant Schema Mass via Attention Entropy]
 \label{lem:entropy_collapse}
-Let $P_{\textnormal{attn}}(\cdot \mid \mathbf{h}_{\le t})$ be the normalized cross-attention distribution over $M \ge 2$ candidate tool schemas at decode step $t$, and let $p_{\max}(t) = \max_{w_k \in \mathcal{W}} P_{\textnormal{attn}}(w_k \mid \mathbf{h}_{\le t})$ denote the probability mass assigned to the dominant tool schema $w^*$. If the normalized Shannon entropy satisfies $H_{\textnormal{attn}}^{(8:16)}(t) \le H_{\max} \in (0, 1)$, then the dominant tool probability $p_{\max}(t)$ satisfies the exact R\'enyi min-entropy lower bound and Fano-type upper envelope:
+Let $P_{\textnormal{attn}}(\cdot \mid \mathbf{h}_{\le t})$ be the normalized cross-attention distribution over $M \ge 2$ candidate tool schemas at decode step $t$, and let $p_{\max}(t) = \max_{w_k \in \mathcal{W}} P_{\textnormal{attn}}(w_k \mid \mathbf{h}_{\le t})$ denote the probability mass assigned to the dominant tool schema $w^*$. If the normalized Shannon entropy satisfies $H_{\textnormal{attn}}^{(8:16)}(t) \le H_{\max} \in (0, 1)$, then the dominant tool probability $p_{\max}(t)$ satisfies the exact R\'enyi min-entropy lower bound:
 \begin{equation}
-\resizebox{0.88\columnwidth}{!}{$\displaystyle
-\begin{aligned}
-\ln\!\left(\frac{1}{p_{\max}(t)}\right) \le H_{\textnormal{attn}}^{(8:16)}(t) \ln M &\le H_{\max} \ln M \implies p_{\max}(t) \ge M^{-H_{\max}}, \\
-H_{\textnormal{attn}}^{(8:16)}(t) \ln M &\le h_2\!\left(p_{\max}(t)\right) + \left(1 - p_{\max}(t)\right) \ln(M - 1),
-\end{aligned}
-$}
-\label{eq:fano_entropy}
+p_{\max}(t) \ge M^{-H_{\max}} = \exp\!\left(-H_{\max} \ln M\right).
+\label{eq:renyi_min_bound}
 \end{equation}
-where $h_2(p) = -p \ln p - (1-p)\ln(1-p)$ is the binary Shannon entropy in nats. In particular, for any catalog size $M \ge 4$ and entropy gate $H_{\max} = 0.72$, every state passing the entropy filter strictly concentrates mass above the uniform baseline ($p_{\max}(t) \ge M^{-0.72} \gg 1/M$).
+Furthermore, defining the monotonic Fano upper-entropy envelope $g_M(p) = h_2(p) + (1-p)\ln(M-1)$ for $p \in [1/M, 1]$ (where $h_2(p) = -p \ln p - (1-p)\ln(1-p)$ is the binary Shannon entropy in nats, strictly decreasing from $g_M(1/M) = \ln M$ to $g_M(1) = 0$), any distribution whose residual mass is uniform across the competing $M-1$ schemas satisfies:
+\begin{equation}
+p_{\max}(t) \ge g_M^{-1}\!\left(H_{\max} \ln M\right).
+\label{eq:fano_entropy_envelope}
+\end{equation}
+In particular, for any catalog size $M \ge 4$ and entropy gate $H_{\max} = 0.72$, every state passing the entropy filter strictly concentrates mass above the uniform baseline ($p_{\max}(t) \ge M^{-0.72} \gg 1/M$).
 \end{lemma}
 
 \begin{proof}
-Since $P_{\textnormal{attn}}(w_k \mid \mathbf{h}_{\le t}) \le p_{\max}(t)$ for all $k \in \{1,\dots,M\}$, the monotonic logarithm satisfies $-\ln P_{\textnormal{attn}}(w_k \mid \mathbf{h}_{\le t}) \ge \ln(1 / p_{\max}(t))$ for every $k$. Taking the expectation over $P_{\textnormal{attn}}$ (equivalently, invoking the monotonicity of R\'enyi entropies $H_\infty(P) \le H_1(P)$) yields:
+By definition, $P_{\textnormal{attn}}(w_k \mid \mathbf{h}_{\le t}) \le p_{\max}(t)$ for all $k \in \{1,\dots,M\}$. Monotonicity of the logarithm implies $-\ln P_{\textnormal{attn}}(w_k \mid \mathbf{h}_{\le t}) \ge \ln(1 / p_{\max}(t))$ for every $k$. Taking the expectation under $P_{\textnormal{attn}}$ (or equivalently, invoking the monotonicity of R\'enyi entropies $H_\infty(P) \le H_1(P)$) yields:
 \begin{equation}
 \resizebox{0.88\columnwidth}{!}{$\displaystyle
-\begin{aligned}
-H_{\textnormal{attn}}^{(8:16)}(t) \ln M &= \sum_{k=1}^M P_{\textnormal{attn}}(w_k) \ln\!\left(\frac{1}{P_{\textnormal{attn}}(w_k)}\right) \\
-&\ge \sum_{k=1}^M P_{\textnormal{attn}}(w_k) \ln\!\left(\frac{1}{p_{\max}(t)}\right) = \ln\!\left(\frac{1}{p_{\max}(t)}\right),
-\end{aligned}
+H_{\textnormal{attn}}^{(8:16)}(t) \ln M = \sum_{k=1}^M P_{\textnormal{attn}}(w_k) \ln\!\left(\frac{1}{P_{\textnormal{attn}}(w_k)}\right) \ge \ln\!\left(\frac{1}{p_{\max}(t)}\right),
 $}
 \end{equation}
-where equality holds when $1/p_{\max}(t)$ is an integer and $P_{\textnormal{attn}}$ concentrates on $1/p_{\max}(t)$ schemas of equal mass $p_{\max}(t)$ (which minimizes Shannon entropy subject to $\max_k P_k = p_{\max}$ by Schur-concavity). Applying $H_{\textnormal{attn}}^{(8:16)}(t) \le H_{\max}$ immediately gives $p_{\max}(t) \ge M^{-H_{\max}}$. Conversely, grouping the $M$ tool outcomes into the dominant schema $w^*$ with mass $p_{\max}(t)$ and the remaining $M-1$ schemas with residual mass $1 - p_{\max}(t)$, the chain rule of Shannon entropy gives $H_{\textnormal{attn}}^{(8:16)}(t)\ln M = h_2(p_{\max}(t)) + (1 - p_{\max}(t)) H(Q_{\textnormal{rest}}) \le h_2(p_{\max}(t)) + (1 - p_{\max}(t))\ln(M-1)$ by Jensen's inequality, establishing both bounds in Eq.~\eqref{eq:fano_entropy}.
+where equality holds when $1/p_{\max}(t)$ is an integer and $P_{\textnormal{attn}}$ is uniform on $1/p_{\max}(t)$ schemas of equal mass $p_{\max}(t)$ (which minimizes Shannon entropy for a given max-probability by Schur-concavity). Exponentiating and applying the entropy filter $H_{\textnormal{attn}}^{(8:16)}(t) \le H_{\max}$ yields $p_{\max}(t) \ge \exp(-H_{\max} \ln M) = M^{-H_{\max}}$, establishing Eq.~\eqref{eq:renyi_min_bound}.
+For Eq.~\eqref{eq:fano_entropy_envelope}, Fano's inequality and the chain rule of entropy show that for any $M$-ary distribution with max-probability $p_{\max}$, the Shannon entropy is upper-bounded by $H(P) \le g_M(p_{\max}) = h_2(p_{\max}) + (1 - p_{\max}) \ln(M-1)$. The derivative $g_M'(p) = \ln((1-p)/p) - \ln(M-1) = \ln\big(\frac{1-p}{p(M-1)}\big) < 0$ for all $p \in (1/M, 1]$, so $g_M$ is strictly decreasing and its inverse $g_M^{-1} : [0, \ln M] \to [1/M, 1]$ is uniquely defined. Under worst-case residual dispersion, $H_{\textnormal{attn}}^{(8:16)}(t) \ln M = g_M(p_{\max}(t)) \le H_{\max} \ln M \iff p_{\max}(t) \ge g_M^{-1}(H_{\max} \ln M)$, completing the proof.
 \end{proof}
 
 When the model is still deliberating among multiple tools during initial reasoning tokens, $P_{\text{attn}}$ is diffuse and $H_{\text{attn}}^{(8:16)}(t) \in [0.82, 0.99]$. Once internal routing commits to a single tool schema $w^*$, $P_{\text{attn}}(w^* \mid \mathbf{h}_{\le t}) \to 1$ and $H_{\text{attn}}^{(8:16)}(t)$ drops sharply below $H_{\max} = 0.72$.
@@ -362,32 +360,31 @@ s\!\left(x, (\hat{w}, \hat{\mathbf{a}})\right) = 1 - \Big( &0.45\, P_{\text{fuse
 \end{equation}
 and define the corresponding conformal confidence $C_{\text{conf}}(t) = 1 - s(x, (\hat{w}, \hat{\mathbf{a}}))$.
 
-\begin{theorem}[Split-Conformal Early-Exit Tool Prediction Coverage and Selective False-Dispatch Control]
+\begin{theorem}[Conformal Risk Control of Early-Exit Speculative Tool Dispatches]
 \label{thm:conformal}
-Let $\mathcal{D}_{\textnormal{cal}} = \{(x_i, y_i^*)\}_{i=1}^{n_{\textnormal{cal}}}$ be an exchangeable calibration dataset of $n_{\textnormal{cal}}$ agent tool-calling traces where $y_i^* = (w_i^*, \mathbf{a}_i^*)$ denotes the canonical ground-truth tool call emitted at $t_{\textnormal{eos}}$. For each trace $i$, let $t_i = \min\{t \in [t_{\textnormal{start}}, t_{\textnormal{eos}}) : H_{\textnormal{attn}}^{(8:16)}(t) \le H_{\max} \wedge \mathcal{A}_{\textnormal{req}}(\hat{w}_t) \subseteq \operatorname{dom}(\hat{\mathbf{a}}_t)\}$ denote the deterministic candidate stopping step, with prediction $\hat{y}_i = (\hat{w}_{t_i}, \hat{\mathbf{a}}_{t_i})$ and score $s_i = s(x_i, \hat{y}_i) = 1 - C_{\textnormal{conf}}(x_i)$. Then:
+Let $\mathcal{D}_{\textnormal{cal}} = \{(x_i, y_i^*)\}_{i=1}^{n_{\textnormal{cal}}}$ be an exchangeable calibration dataset of $n_{\textnormal{cal}}$ agent tool-calling traces where $y_i^* = (w_i^*, \mathbf{a}_i^*)$ denotes the canonical ground-truth tool call emitted at $t_{\textnormal{eos}}$. For any trace $i$, let $t_i = \min\{t \in [t_{\textnormal{start}}, t_{\textnormal{eos}}) : H_{\textnormal{attn}}^{(8:16)}(t) \le H_{\max} \wedge \mathcal{A}_{\textnormal{req}}(\hat{w}_t) \subseteq \operatorname{dom}(\hat{\mathbf{a}}_t)\}$ denote the deterministic candidate stopping step, with prediction $\hat{y}_i = (\hat{w}_{t_i}, \hat{\mathbf{a}}_{t_i})$. For any dispatch confidence threshold $\tau \in [0, 1]$, define the binary dispatch decision $\operatorname{Dispatch}(x, \tau) = \mathbb{I}[C_{\textnormal{conf}}(x) \ge \tau]$ and the False Discovery Rate (FDR) loss:
+\begin{equation}
+L(\tau; x, y^*) = \frac{\mathbb{I}\!\left[\operatorname{Dispatch}(x, \tau) = 1 \wedge \operatorname{AST}(\hat{y}) \ne \operatorname{AST}(y^*)\right]}{\max\left(1, \; \mathbb{I}\!\left[\operatorname{Dispatch}(x, \tau) = 1\right]\right)}.
+\end{equation}
+Then:
 \begin{enumerate}
-    \item \textbf{Positive-Class Recall Coverage:} Let $s_{(1)} \le \dots \le s_{(n_+)}$ be the order statistics on the positive calibration subset $\mathcal{I}_+ = \{i : \operatorname{AST}(\hat{y}_i) = \operatorname{AST}(y_i^*)\}$. Setting $\hat{q}_{1-\alpha} = s_{(\lceil (n_+ + 1)(1 - \alpha) \rceil)}$ and $\tau_{\textnormal{conf}}(\alpha) = 1 - \hat{q}_{1-\alpha}$ guarantees that for a new exchangeable test trace $(X_{\textnormal{test}}, Y_{\textnormal{test}}^*)$,
+    \item \textbf{Selective False-Dispatch Risk Control via CRC:} Defining the empirical false-dispatch risk with Laplace smoothing:
     \begin{equation}
-    \resizebox{0.84\columnwidth}{!}{$\displaystyle
-    \begin{aligned}
-    1 - \alpha &\le \mathbb{P}\!\left( C_{\textnormal{conf}}(X_{\textnormal{test}}) \ge \tau_{\textnormal{conf}}(\alpha) \,\middle|\, \operatorname{AST}(\hat{Y}_{\textnormal{test}}) = \operatorname{AST}(Y_{\textnormal{test}}^*) \right) \\
-    &\le 1 - \alpha + \frac{1}{n_+ + 1}.
-    \end{aligned}
-    $}
-    \label{eq:conformal_bound}
+    \hat{R}(\tau) = \frac{\sum_{i=1}^{n_{\textnormal{cal}}} \mathbb{I}\!\left[C_{\textnormal{conf}}(x_i) \ge \tau \wedge \operatorname{AST}(\hat{y}_i) \ne \operatorname{AST}(y_i^*)\right] + 1}{\sum_{i=1}^{n_{\textnormal{cal}}} \mathbb{I}\!\left[C_{\textnormal{conf}}(x_i) \ge \tau\right] + 1},
     \end{equation}
-    \item \textbf{Selective False-Dispatch Risk Control:} Define the empirical false-dispatch risk at threshold $\tau$ over all $n_{\textnormal{cal}}$ calibration traces as $\hat{R}(\tau) = \frac{\sum_{i=1}^{n_{\textnormal{cal}}} \mathbb{I}[C_{\textnormal{conf}}(x_i) \ge \tau \wedge \operatorname{AST}(\hat{y}_i) \ne \operatorname{AST}(y_i^*)] + 1}{\sum_{i=1}^{n_{\textnormal{cal}}} \mathbb{I}[C_{\textnormal{conf}}(x_i) \ge \tau] + 1}$. By Conformal Risk Control~\cite{angelopoulos2023conformal}, selecting $\tau_{\textnormal{conf}}(\alpha) = \inf\{\tau \in [0,1] : \hat{R}(\tau') \le \alpha,\; \forall \tau' \ge \tau\}$ bounds the conditional speculative mismatch rate $1 - \eta = \mathbb{P}(\operatorname{AST}(\hat{Y}_{\textnormal{test}}) \ne \operatorname{AST}(Y_{\textnormal{test}}^*) \mid C_{\textnormal{conf}}(X_{\textnormal{test}}) \ge \tau_{\textnormal{conf}}(\alpha)) \le \alpha$ up to $O(1/\sqrt{n_{\textnormal{cal}}})$ finite-sample concentration.
+    the calibrated threshold $\tau_{\textnormal{conf}}(\alpha) = \inf\{\tau \in [0,1] : \hat{R}(\tau') \le \alpha,\; \forall \tau' \ge \tau\}$ guarantees under Conformal Risk Control~\cite{angelopoulos2023conformal} that for an exchangeable test trace $(X_{\textnormal{test}}, Y_{\textnormal{test}}^*)$:
+    \begin{equation}
+    \mathbb{E}\!\left[ L(\tau_{\textnormal{conf}}(\alpha); X_{\textnormal{test}}, Y_{\textnormal{test}}^*) \right] \le \alpha + \mathcal{O}\!\left(\frac{1}{\sqrt{n_{\textnormal{cal}}}}\right),
+    \label{eq:conformal_fdr_bound}
+    \end{equation}
+    bounding the expected conditional speculative mismatch rate $1 - \eta \le \alpha$.
+    \item \textbf{Positive-Class Recall Coverage:} Let $s_{(1)} \le \dots \le s_{(n_+)}$ be the order statistics of nonconformity scores $s_i = 1 - C_{\textnormal{conf}}(x_i)$ on the positive calibration subset $\mathcal{I}_+ = \{i : \operatorname{AST}(\hat{y}_i) = \operatorname{AST}(y_i^*)\}$. Setting $\hat{q}_{1-\beta} = s_{(\lceil (n_+ + 1)(1 - \beta) \rceil)}$ ensures marginal positive-class coverage $\mathbb{P}(C_{\textnormal{conf}}(X_{\textnormal{test}}) \ge 1 - \hat{q}_{1-\beta} \mid \operatorname{AST}(\hat{Y}_{\textnormal{test}}) = \operatorname{AST}(Y_{\textnormal{test}}^*)) \ge 1 - \beta$.
 \end{enumerate}
 \end{theorem}
 
 \begin{proof}
-For Part~(1), because $t_i$ is a deterministic stopping rule applied identically to each exchangeable trace, the positive-class nonconformity scores $\{s_i : i \in \mathcal{I}_+\}$ and $s_{\textnormal{test}}$ conditioned on $\operatorname{AST}(\hat{Y}_{\textnormal{test}}) = \operatorname{AST}(Y_{\textnormal{test}}^*)$ are exchangeable random variables in $[0, 1]$~\cite{angelopoulos2023conformal, shafer2008tutorial}. Consequently, the rank of $s_{\textnormal{test}}$ among $\{s_i\}_{i \in \mathcal{I}_+} \cup \{s_{\textnormal{test}}\}$ is uniform on $\{1, \dots, n_+ + 1\}$, yielding:
-\begin{equation}
-\resizebox{0.88\columnwidth}{!}{$\displaystyle
-\mathbb{P}\!\left( s_{\textnormal{test}} \le \hat{q}_{1-\alpha} \right) = \frac{\lceil (n_+ + 1)(1 - \alpha) \rceil}{n_+ + 1} \in \left[ 1 - \alpha,\, 1 - \alpha + \frac{1}{n_+ + 1} \right],
-$}
-\end{equation}
-which is equivalent to Eq.~\eqref{eq:conformal_bound} via $C_{\textnormal{conf}} = 1 - s$. For Part~(2), since the selective classification loss $\mathbb{I}[\operatorname{AST}(\hat{y}_i) \ne \operatorname{AST}(y_i^*)]$ is bounded in $\{0,1\}$ and the empirical selective risk $\hat{R}(\tau)$ incorporates the Laplace $+1$ finite-sample correction over exchangeable draws from $\mathcal{D}_{\textnormal{cal}}$, standard Conformal Risk Control / Learn-Then-Test calibration~\cite{angelopoulos2023conformal} guarantees that $\tau_{\textnormal{conf}}(0.10) = 0.82$ controls both false-negative recall ($\ge 90.0\%$) and the conditional false-dispatch rate ($1 - \eta = 10.6\%$ empirically on the held-out test suite).
+For Part~(1), the per-trace loss $L(\tau; x_i, y_i^*) \in [0, 1]$ is monotonically non-increasing in $\tau$ because the dispatch set $\{x : C_{\textnormal{conf}}(x) \ge \tau\}$ contracts monotonically as $\tau$ increases. Because the calibration traces $\mathcal{D}_{\textnormal{cal}}$ and test trace $(X_{\textnormal{test}}, Y_{\textnormal{test}}^*)$ are exchangeable, the empirical risk $\hat{R}(\tau)$ with the $+1$ Laplace correction constitutes an admissible upper-confidence bound on the population risk $\mathbb{E}[L(\tau)]$. Applying the Conformal Risk Control framework (Angelopoulos et al.~\cite{angelopoulos2023conformal}, Theorem~1) ensures that the stopping threshold $\tau_{\textnormal{conf}}(\alpha)$ controls the expected risk $\mathbb{E}[L(\tau_{\textnormal{conf}}(\alpha))] \le \alpha$, establishing Eq.~\eqref{eq:conformal_fdr_bound}. At $\alpha = 0.10$ on $n_{\textnormal{cal}} = 500$ held-out traces, $\tau_{\textnormal{conf}}(0.10) = 0.82$, yielding an empirical conditional false-dispatch rate of $1 - \eta = 10.6\%$ on the held-out test suite.
+For Part~(2), because $t_i$ is a deterministic stopping rule applied identically across exchangeable traces, the positive scores $\{s_i : i \in \mathcal{I}_+\}$ and $s_{\textnormal{test}}$ conditioned on AST equivalence are exchangeable random variables in $[0, 1]$~\cite{shafer2008tutorial}. The rank of $s_{\textnormal{test}}$ among the $n_+ + 1$ values is uniform on $\{1, \dots, n_+ + 1\}$, giving $\mathbb{P}(s_{\textnormal{test}} \le \hat{q}_{1-\beta}) = \frac{\lceil (n_+ + 1)(1 - \beta) \rceil}{n_+ + 1} \ge 1 - \beta$.
 \end{proof}
 
 When $H_{\text{attn}}^{(8:16)}(t) \le 0.72$, $C_{\text{conf}}(t) \ge \tau_{\text{conf}} = 0.82$ (calibrated at $\alpha = 0.10$ on $n_{\text{cal}} = 500$ held-out calibration traces), and all required parameters $\mathcal{A}_{\text{req}}(\hat{w})$ are populated, Stage~1 fires a speculative prefetch trigger with estimated lead time $T_{\text{lead}} = (t_{\text{eos}} - t_{\text{branch}}) \cdot \tau_{\text{tok}} \in [150\text{ ms}, 400\text{ ms}]$.
@@ -1116,7 +1113,7 @@ Limit / Aggregation Change & \texttt{LIMIT 10} vs.\ \texttt{LIMIT 50} & \textbf{
 }
 \end{table}
 
-\begin{thebibliography}{38}
+\begin{thebibliography}{36}
 
 \bibitem{leviathan2023fast}
 Y.~Leviathan, M.~Kalman, and Y.~Matias, ``Fast inference from transformers via speculative decoding,'' in \emph{Proc. 40th International Conference on Machine Learning (ICML)}, vol. 202, 2023, pp. 19274--19286.
@@ -1153,9 +1150,6 @@ T.~Dao, D.~Y. Fu, S.~Ermon, A.~Rudra, and C.~R{\'e}, ``{FlashAttention}: Fast an
 
 \bibitem{dao2024flashattention2}
 T.~Dao, ``{FlashAttention-2}: Faster attention with better parallelism and work partitioning,'' in \emph{Proc. International Conference on Learning Representations (ICLR)}, 2024.
-
-\bibitem{jouppi2023tpuv4}
-N.~P. Jouppi, G.~Kurian, S.~Li, P.~Ma, R.~Nagarajan, L.~Nai, N.~Patil, S.~Subramanian, A.~Swing, B.~Towles \emph{et~al.}, ``{TPU v4}: An optically reconfigurable supercomputer for machine learning with hardware support for embeddings,'' in \emph{Proc. 50th Annual International Symposium on Computer Architecture (ISCA)}, 2023, pp. 1--14.
 
 \bibitem{google2024trillium}
 {Google Cloud}, ``{Cloud TPU v6e (Trillium)} architecture and system specifications,'' Google Cloud Documentation, 2024. [Online]. Available: \url{https://cloud.google.com/tpu/docs/v6e}.
@@ -1216,9 +1210,6 @@ E.~B. Nightingale, P.~M. Chen, and J.~Flinn, ``Speculative execution in a distri
 
 \bibitem{tomasulo1967efficient}
 R.~M. Tomasulo, ``An efficient algorithm for exploiting multiple arithmetic units,'' \emph{IBM Journal of Research and Development}, vol.~11, no.~1, pp. 25--33, 1967.
-
-\bibitem{hennessy2019new}
-J.~L. Hennessy and D.~A. Patterson, ``A new golden age for computer architecture,'' \emph{Communications of the ACM}, vol.~62, no.~2, pp. 48--60, 2019.
 
 \bibitem{debenedetti2025camel}
 E.~Debenedetti, I.~Shumailov, T.~Fan, J.~Hayes, N.~Carlini, D.~Fabian, C.~Kern, C.~Shi, A.~Terzis, and F.~Tram{\`e}r, ``Defeating prompt injections by design,'' \emph{arXiv preprint arXiv:2503.18813}, 2025.
