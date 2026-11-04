@@ -84,7 +84,8 @@ Three classes of prior systems attempt to reduce LLM inference latency or orches
 \renewcommand{\arraystretch}{1.10}
 \caption{Architectural Comparison of Agent-Synapse Against Prior Speculative Decoding, Agentic Compilation, and KV-Cache Serving Frameworks}
 \label{tab:arch_comparison}
-\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccc@{}}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lcccccc@{}}
 \toprule
 \textbf{System / Paradigm} & \textbf{Overlaps Decode w/ External I/O} & \textbf{Pre-EOS Lead Time ($T_{\text{lead}}$)} & \textbf{Formal False-Dispatch Bound} & \textbf{Idempotency \& DML Wire Gate} & \textbf{Canonical AST Equivalence} & \textbf{Mismatch KV Rollback Latency} \\
 \midrule
@@ -97,7 +98,8 @@ Unchecked Early Speculation & Yes (Unsafe) & $150\text{--}400\text{ ms}$ & None 
 \midrule
 \textbf{Agent-Synapse (Ours)} & \textbf{Yes (Intra-Turn NIC)} & $\mathbf{150\text{--}400\text{ \textbf{ms}}}$ & \textbf{Split-Conformal ($\tau_{\text{conf}}$)} & \textbf{3-Tier + DML ($0.0\%$)} & \textbf{SHA-256 AST ($89.4\%$)} & $\mathbf{< 12\,\mu\text{\textbf{s}}}$ \textbf{(SRAM CoW)} \\
 \bottomrule
-\end{tabular*}
+\end{tabular}%
+}
 \end{table*}
 
 \subsection{Contributions of Agent-Synapse}
@@ -467,7 +469,7 @@ where $\mathcal{P}_{\text{base}} = (p_0, \dots, p_{N_{\text{base}}-1})$ freezes 
 To achieve $< 12\,\mu\text{s}$ rollback latency ($p_{50} = 4.2\,\mu\text{s}, p_{99} = 9.8\,\mu\text{s}$), Stage~3 maps the Copy-on-Write page table directly onto the hardware descriptor primitives of each accelerator architecture:
 \begin{enumerate}
     \item \textbf{Cloud TPU v6e (Trillium) VMEM/CMEM DMA Descriptor Path:} On TPU v6e, the sequence block table $\mathcal{P}_{\text{SRAM}}$ resides in a dedicated $64\text{ KB}$ region of Scalar/Vector Memory (VMEM). When Stage~1 triggers at $t_{\text{branch}}$, the VPU executes a single vectorized register move (\texttt{vmov.u32}) copying the active descriptor vector $\mathcal{P}_{\text{base}}$ into a shadow VMEM slot and increments the per-page reference counters in $1.4\,\mu\text{s}$. When the speculative FastMCP payload arrives from the host NIC over PCIe/ICI, an asynchronous host-to-device DMA engine streams the pre-tokenized response embeddings into the shadow page frames $\mathcal{P}_{\text{shadow}}$ without interrupting the MXU systolic arrays executing tokens $t \in [t_{\text{branch}}+1, t_{\text{eos}}]$. On an AST mismatch at $t_{\text{eos}}$, the scalar core restores the active page table pointer register to $\mathcal{P}_{\text{base}}$ and clears the shadow sync flags in $p_{50} = 3.8\,\mu\text{s}$ ($p_{99} = 9.4\,\mu\text{s}$).
-    \item \textbf{NVIDIA Blackwell B200 L2/TMEM Tensor Memory Accelerator Path:} On NVIDIA B200, $\mathcal{P}_{\text{SRAM}}$ is pinned in L2 persistence-locked SRAM and mirrored into Tensor Memory (TMEM) via a 128-byte aligned TMA descriptor (`CUtensorMap`). Creating the micro-checkpoint at $t_{\text{branch}}$ snapshots the TMA page-offset array in $1.7\,\mu\text{s}$. While the primary CUDA stream continues decoding tokens $t \in [t_{\text{branch}}+1, t_{\text{eos}}]$, a secondary low-priority CUDA stream receives the prefetched FastMCP response via GPUDirect RDMA / pinned host staging and populates $\mathcal{P}_{\text{shadow}}$. Upon an AST mismatch at $t_{\text{eos}}$, a single warp kernel restores the TMA page-offset array to $\mathcal{P}_{\text{base}}$ in $p_{50} = 4.4\,\mu\text{s}$ ($p_{99} = 10.1\,\mu\text{s}$).
+    \item \textbf{NVIDIA Blackwell B200 L2/TMEM Tensor Memory Accelerator Path:} On NVIDIA B200, $\mathcal{P}_{\text{SRAM}}$ is pinned in L2 persistence-locked SRAM and mirrored into Tensor Memory (TMEM) via a 128-byte aligned TMA descriptor (\texttt{CUtensorMap}). Creating the micro-checkpoint at $t_{\text{branch}}$ snapshots the TMA page-offset array in $1.7\,\mu\text{s}$. While the primary CUDA stream continues decoding tokens $t \in [t_{\text{branch}}+1, t_{\text{eos}}]$, a secondary low-priority CUDA stream receives the prefetched FastMCP response via GPUDirect RDMA / pinned host staging and populates $\mathcal{P}_{\text{shadow}}$. Upon an AST mismatch at $t_{\text{eos}}$, a single warp kernel restores the TMA page-offset array to $\mathcal{P}_{\text{base}}$ in $p_{50} = 4.4\,\mu\text{s}$ ($p_{99} = 10.1\,\mu\text{s}$).
 \end{enumerate}
 
 The total rollback latency $T_{\text{rb}}$ on either accelerator decomposes into three microarchitectural components:
@@ -478,7 +480,7 @@ T_{\text{rb}} = T_{\text{ast\_verify}} + T_{\text{sram\_ptr\_swap}} + T_{\text{s
 where $T_{\text{ast\_verify}} \approx 1.8\,\mu\text{s}$ is the SHA-256 canonical AST digest comparison, $T_{\text{sram\_ptr\_swap}} \approx 1.6\,\mu\text{s}$ is the vectorized SRAM page-table pointer restoration, and $T_{\text{shadow\_free}} \approx 0.8\,\mu\text{s}$ is the bitmap deallocation of the shadow frames $\mathcal{P}_{\text{shadow}}$.
 
 \subsection{Canonical Abstract Syntax Tree (AST) Equivalence Splicing}
-A naive byte-for-byte string comparison between the early-layer predicted call $(\hat{w}, \hat{\mathbf{a}})$ and the final emitted call $(w^*, \mathbf{a}^*)$ at $t_{\text{eos}}$ suffers from unnecessary false rejections whenever the model permutes JSON dictionary keys, varies whitespace, emits `100.0` vs.\ `100`, or commutes conjunctive predicates in SQL or ISO GQL \texttt{WHERE} clauses.
+A naive byte-for-byte string comparison between the early-layer predicted call $(\hat{w}, \hat{\mathbf{a}})$ and the final emitted call $(w^*, \mathbf{a}^*)$ at $t_{\text{eos}}$ suffers from unnecessary false rejections whenever the model permutes JSON dictionary keys, varies whitespace, emits \texttt{100.0} vs.\ \texttt{100}, or commutes conjunctive predicates in SQL or ISO GQL \texttt{WHERE} clauses.
 
 To maximize the effective speculative hit rate without compromising exact semantic fidelity, Stage~3 parses both $(\hat{w}, \hat{\mathbf{a}})$ and $(w^*, \mathbf{a}^*)$ through a deterministic canonicalization operator $\Psi_{\text{AST}}$:
 \begin{enumerate}
@@ -497,7 +499,7 @@ Let $(\hat{w}, \hat{\mathbf{a}})$ and $(w^*, \mathbf{a}^*)$ be two well-typed Fa
 \begin{equation}
 h_{\textnormal{AST}}(\hat{w}, \hat{\mathbf{a}}) = \operatorname{SHA-256}\!\left(\operatorname{CanonicalJSON}\!\left(\hat{w}, \Psi_{\textnormal{AST}}(\hat{\mathbf{a}})\right)\right) = h_{\textnormal{AST}}(w^*, \mathbf{a}^*),
 \end{equation}
-then up to SHA-256 collision resistance ($2^{-256}$), the backend execution results are semantically identical: $\llbracket \hat{w}(\hat{\mathbf{a}}) \rrbracket_{\Sigma_{\textnormal{db}}} = \llbracket w^*(\mathbf{a}^*) \rrbracket_{\Sigma_{\textnormal{db}}}$.
+then up to SHA-256 collision resistance ($2^{-256}$), the backend execution results are semantically identical: $[\![ \hat{w}(\hat{\mathbf{a}}) ]\!]_{\Sigma_{\textnormal{db}}} = [\![ w^*(\mathbf{a}^*) ]\!]_{\Sigma_{\textnormal{db}}}$.
 \end{proposition}
 
 \begin{proof}
@@ -681,7 +683,7 @@ We compare Agent-Synapse against three baselines: (i) \textbf{Standard Serial Fa
     enlarge x limits=0.20,
     ymajorgrids=true,
     grid style={dashed, gray!30},
-    legend pos=upper left,
+    legend pos=north west,
     legend style={font=\scriptsize, fill=white, draw=bordergray},
     tick label style={font=\scriptsize},
     nodes near coords,
@@ -832,10 +834,10 @@ $-$ Stage 3 SRAM CoW (HBM Re-Prefill) & $89.4\%$ & $366.8\text{ ms}$ & $44{,}100
 \end{table}
 
 \subsection{Microsecond SRAM Copy-on-Write Rollback vs.\ HBM Re-Prefill}
-Table~\ref{tab:main_benchmark} (Panel~B) and Table~\ref{tab:ablation} compare Stage~3's on-chip SRAM Copy-on-Write page-table rollback against standard HBM KV-cache eviction and re-prefill across the $79$ speculative mismatches ($10.6\%$). When an unpinned speculative payload must be evicted from HBM and the context re-prefilled, standard serving engines incur $28.4\text{ ms}$ at $p_{50}$ and $44.1\text{ ms}$ at $p_{99}$. By instead pinning the pre-branch page-table descriptor $\mathcal{P}_{\text{base}}$ in on-chip SRAM (Cloud TPU v6e VMEM/CMEM or NVIDIA B200 TMEM) and writing speculative tokens exclusively to shadow pages $\mathcal{P}_{\text{shadow}}$, Agent-Synapse restores $\mathcal{P}_{\text{SRAM}} \leftarrow \mathcal{P}_{\text{base}}$ in \textbf{$4.2\,\mu\text{s}$ at $p_{50}$ and $9.8\,\mu\text{s}$ at $p_{99}$} ($3.8\,\mu\text{s}$ $p_{50}$ on Cloud TPU v6e and $4.4\,\mu\text{s}$ $p_{50}$ on NVIDIA B200), strictly satisfying the $< 12.0\,\mu\text{s}$ hardware SLA and achieving a **$3{,}800\times$ rollback speedup**.
+Table~\ref{tab:main_benchmark} (Panel~B) and Table~\ref{tab:ablation} compare Stage~3's on-chip SRAM Copy-on-Write page-table rollback against standard HBM KV-cache eviction and re-prefill across the $79$ speculative mismatches ($10.6\%$). When an unpinned speculative payload must be evicted from HBM and the context re-prefilled, standard serving engines incur $28.4\text{ ms}$ at $p_{50}$ and $44.1\text{ ms}$ at $p_{99}$. By instead pinning the pre-branch page-table descriptor $\mathcal{P}_{\text{base}}$ in on-chip SRAM (Cloud TPU v6e VMEM/CMEM or NVIDIA B200 TMEM) and writing speculative tokens exclusively to shadow pages $\mathcal{P}_{\text{shadow}}$, Agent-Synapse restores $\mathcal{P}_{\text{SRAM}} \leftarrow \mathcal{P}_{\text{base}}$ in \textbf{$4.2\,\mu\text{s}$ at $p_{50}$ and $9.8\,\mu\text{s}$ at $p_{99}$} ($3.8\,\mu\text{s}$ $p_{50}$ on Cloud TPU v6e and $4.4\,\mu\text{s}$ $p_{50}$ on NVIDIA B200), strictly satisfying the $< 12.0\,\mu\text{s}$ hardware SLA and achieving a \textbf{$3{,}800\times$ rollback speedup}.
 
 \subsection{Detailed Canonical AST Normalization Algorithm and Grammar Rules}
-Algorithm~\ref{alg:ast_canon} formalizes the exact recursive canonicalization operator $\Psi_{\text{AST}}$ and constant-time SHA-256 splicing check executed by Stage~3 at step $t_{\text{eos}}$. Unlike heuristic fuzzy matching---which risks splicing a prefetched database response when a filter literal has actually changed (e.g., `risk_score > 0.85` vs.\ `risk_score > 0.95`)---$\Psi_{\text{AST}}$ applies strictly semantics-preserving algebraic equivalence transformations over JSON AST nodes and relational/graph query clauses:
+Algorithm~\ref{alg:ast_canon} formalizes the exact recursive canonicalization operator $\Psi_{\text{AST}}$ and constant-time SHA-256 splicing check executed by Stage~3 at step $t_{\text{eos}}$. Unlike heuristic fuzzy matching---which risks splicing a prefetched database response when a filter literal has actually changed (e.g., \texttt{risk\_score > 0.85} vs.\ \texttt{risk\_score > 0.95})---$\Psi_{\text{AST}}$ applies strictly semantics-preserving algebraic equivalence transformations over JSON AST nodes and relational/graph query clauses:
 \begin{enumerate}
     \item \textbf{Lexicographical Key Ordering ($\mathcal{R}_{\text{json}}$):} For any JSON object node $O = \{(k_1, v_1), \dots, (k_m, v_m)\}$, $\Psi_{\text{AST}}(O) = [(k_{\sigma(1)}, \Psi_{\text{AST}}(v_{\sigma(1)})), \dots, (k_{\sigma(m)}, \Psi_{\text{AST}}(v_{\sigma(m)}))]$ where $k_{\sigma(1)} < \dots < k_{\sigma(m)}$ in UTF-8 code-point order.
     \item \textbf{Exact Numeric Canonicalization ($\mathcal{R}_{\text{num}}$):} Numeric literals $v \in \mathbb{R}$ satisfying $v = \lfloor v \rfloor$ and $|v| < 2^{53}$ are canonicalized to their base-10 integer representation, while non-integral floats are formatted to IEEE-754 shortest round-trip decimal representation.
