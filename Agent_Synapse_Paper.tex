@@ -7,6 +7,7 @@
 \usepackage{algpseudocode}
 \usepackage{graphicx}
 \usepackage{textcomp}
+\usepackage{upquote}
 \usepackage{booktabs}
 \usepackage{array}
 \usepackage{multirow}
@@ -63,11 +64,11 @@ The transition of Large Language Models (LLMs) from passive conversational inter
 \subsection{The Serial Decode-to-I/O Stall in Agentic Serving}
 Under the standard autoregressive tool-calling lifecycle implemented by contemporary agent frameworks (e.g., ReAct~\cite{yao2023react}, ToolLLM~\cite{qin2024toolllm}, vLLM~\cite{kwon2023efficient}, SGLang~\cite{zheng2024sglang}, and FastMCP~\cite{anthropic2024mcp}), each tool invocation turn executes as a strictly sequential two-phase barrier:
 \begin{enumerate}
-    \item \textbf{Phase 1 (Autoregressive Syntax Emission):} To invoke a tool $w \in \mathcal{W}$ with structured JSON arguments $\mathbf{a}$, the foundation model must autoregressively decode $K_{\text{call}} \in [25, 60]$ tokens representing the syntactic wrapper (\texttt{<tool\_call>\{"name": "spanner\_graph\_query\_gql", "arguments": \{"graph\_name": "EnterpriseKG", "gql\_query": "MATCH ..."\}\}</tool\_call>}). At an inter-token decode latency of $\tau_{\text{tok}} \in [9.6\text{ ms}, 11.5\text{ ms}]$ per token for frontier models, generating the syntactic tool-call block consumes $T_{\text{decode}} \in [240\text{ ms}, 650\text{ ms}]$. Throughout this entire window, the host Network Interface Card (NIC) and downstream database engines sit completely idle.
+    \item \textbf{Phase 1 (Autoregressive Syntax Emission):} To invoke a tool $w \in \mathcal{W}$ with structured JSON arguments $\mathbf{a}$, the foundation model must autoregressively decode $K_{\text{call}} \in [25, 70]$ tokens representing the syntactic wrapper (\texttt{<tool\_call>\{"name": "spanner\_graph\_query\_gql", "arguments": \{"graph\_name": "EnterpriseKG", "gql\_query": "MATCH ..."\}\}</tool\_call>}). At an inter-token decode latency of $\tau_{\text{tok}} \in [9.6\text{ ms}, 11.5\text{ ms}]$ per token for frontier models, generating the syntactic tool-call block consumes $T_{\text{decode}} \in [240\text{ ms}, 700\text{ ms}]$. Throughout this entire window, the host Network Interface Card (NIC) and downstream database engines sit completely idle.
     \item \textbf{Phase 2 (Blocking Network I/O Stall):} Only after the final closing delimiter token \texttt{</tool\_call>} is sampled at step $t_{\text{eos}}$ does the host runtime parse the JSON payload and dispatch the outbound HTTP/2 or JSON-RPC 2.0 request over the network. While the external database executes the query ($T_{\text{io}} \in [180\text{ ms}, 550\text{ ms}]$), the AI accelerator stalls on the request, either holding HBM Key-Value (KV) cache pages pinned in memory or incurring costly HBM-to-DRAM swap overhead~\cite{kwon2023efficient}.
 \end{enumerate}
 
-To appreciate the magnitude of this utilization gap, consider a typical $5$-turn investigative workflow executed by a financial compliance agent on a Cloud TPU v6e slice. In each turn, the model spends roughly $300\text{ ms}$ generating $30$ structured JSON tokens (\texttt{<tool\_call>\{...\}</tool\_call>}) and then waits $260\text{ ms}$--$540\text{ ms}$ for Cloud Spanner Graph or BigQuery to return the subgraph or analytical aggregation. Summed over $5$ turns, the user experiences $2.8\text{ s}$ to $4.2\text{ s}$ of wall-clock latency, of which more than $55\%$ is spent waiting on sequential network I/O that could not even begin until the final closing bracket token was emitted.
+To appreciate the magnitude of this utilization gap, consider a typical $5$-turn investigative workflow executed by a financial compliance agent on a Cloud TPU v6e slice. In each turn, the model spends roughly $300\text{ ms}$ generating $30$ structured JSON tokens (\texttt{<tool\_call>\{...\}</tool\_call>}) and then waits $260\text{ ms}$--$540\text{ ms}$ for Cloud Spanner Graph or BigQuery to return the subgraph or analytical aggregation. Summed over $5$ turns, the user experiences $2.8\text{ s}$ to $4.2\text{ s}$ of wall-clock latency, of which up to $64\%$ (and over $55\%$ on average) is spent waiting on sequential network I/O that could not even begin until the final closing bracket token was emitted.
 
 Crucially, mechanistic interpretability studies of transformer representations~\cite{nostalgebraist2020logitlens, belrose2023eliciting, schuster2022confident} reveal a striking physical asymmetry between \emph{internal semantic commitment} and \emph{surface syntactic completion}. When an LLM decides to invoke an enterprise tool, its intermediate hidden states $\mathbf{h}_t^{(l)}$ in layers $l \in [8, 16]$ (out of $L \in [32, 80]$ total layers) lock onto the target tool schema's cross-attention span and bind the primary entity identifiers and query predicates $15$ to $35$ tokens ($T_{\text{lead}} \in [150\text{ ms}, 400\text{ ms}]$) \emph{before} the final unembedding layer finishes spelling out closing JSON braces, quotation marks, optional formatting fields, and the \texttt{</tool\_call>} EOS token. In effect, the accelerator spends $150\text{ ms}$--$400\text{ ms}$ serializing deterministic boilerplate syntax while the network pipeline that could be fetching the required enterprise data remains completely unutilized.
 
@@ -76,6 +77,7 @@ Three classes of prior systems attempt to reduce LLM inference latency or orches
 \begin{itemize}
     \item \textbf{Token-Level Speculative Decoding~\cite{leviathan2023fast, chen2023accelerating, cai2024medusa, li2024eagle}:} Draft-target speculative decoding uses a lightweight draft model or Medusa/EAGLE heads to verify $\gamma \in [3, 5]$ tokens in parallel within a single forward pass. However, token-level speculation operates strictly inside the vocabulary space $\mathcal{V}$; it still halts at \texttt{</tool\_call>} EOS before initiating any external network RPC, leaving $100\%$ of the network I/O latency $T_{\text{io}}$ unoverlapped with token generation. Even if token generation were accelerated by $1.5\times$, a $540\text{ ms}$ tail database query still imposes a full $540\text{ ms}$ sequential post-EOS stall.
     \item \textbf{DAG-Based Parallel Planner Compilers~\cite{kim2024llmcompiler, geng2025sagallm}:} Systems such as LLMCompiler~\cite{kim2024llmcompiler} prompt the LLM to emit a multi-tool dependency DAG so independent branches can execute concurrently. Yet the runtime must still wait until the LLM finishes decoding the \emph{entire} task plan before dispatching the first tool call, providing zero overlap between token decoding and network I/O on single-tool turns or sequential data-dependent chains where Turn $k+1$'s query depends on Turn $k$'s returned rows.
+    \item \textbf{Intra-Turn Speculative Action Frameworks~\cite{ye2025speculative}:} Contemporary efforts such as Speculative Actions~\cite{ye2025speculative} explore drafting tool calls, but operate primarily at the software runtime level without hardware-coupled on-chip SRAM micro-checkpointing, formal conformal risk control, or physical NIC compute-I/O overlap co-design on AI accelerators.
     \item \textbf{Unsandboxed Speculative Execution Hazards~\cite{nightingale2005speculator, patil2024goex}:} In classical operating systems and processor microarchitectures~\cite{tomasulo1967efficient, nightingale2005speculator}, speculative execution relies on hardware reorder buffers (ROBs) or OS process checkpoints to squash mispredicted branches. In enterprise agent environments, however, external tools interact with live production databases and financial rails. If an early-layer predictor mispredicts a tool call or its arguments and prematurely dispatches a non-idempotent \texttt{WRITE}, \texttt{DELETE}, or wire-transfer mutation, the external side effect cannot be undone by rolling back local accelerator memory. Furthermore, if a speculatively prefetched response is pre-appended to the LLM's KV-cache and the model's final token diverges (e.g., changing \texttt{LIMIT 10} to \texttt{LIMIT 25} at token $t_{\text{eos}}-1$), standard serving frameworks must evict the speculative KV blocks from HBM and re-execute attention prefill, incurring a $15\text{ ms}$--$45\text{ ms}$ penalty that wipes out any speculative gain.
 \end{itemize}
 
@@ -94,6 +96,7 @@ Standard ReAct / FastMCP~\cite{yao2023react, anthropic2024mcp} & No (Post-EOS On
 Draft-Target SpecDec~\cite{leviathan2023fast, chen2023accelerating} & No (Vocab Only) & $0\text{ ms}$ & Token Rejection & None & N/A & $1\text{--}3\text{ ms}$ (Draft Reject) \\
 Medusa / EAGLE~\cite{cai2024medusa, li2024eagle} & No (Vocab Only) & $0\text{ ms}$ & Tree Verification & None & N/A & $1\text{--}2\text{ ms}$ (Tree Prune) \\
 LLMCompiler~\cite{kim2024llmcompiler} & Inter-Tool DAG Only & $0\text{ ms}$ (Intra-Turn) & None & None & Exact String & Re-Plan ($>300\text{ ms}$) \\
+Speculative Actions~\cite{ye2025speculative} & Software Only & $50\text{--}150\text{ ms}$ & Heuristic Gate & None & Exact AST & Host Re-Draft ($>20\text{ ms}$) \\
 GoEX Undo/Post-Facto~\cite{patil2024goex} & No (Post-EOS) & $0\text{ ms}$ & None & Compensating Log & None & $50\text{--}500\text{ ms}$ (Undo RPC) \\
 Unchecked Early Speculation & Yes (Unsafe) & $150\text{--}400\text{ ms}$ & None (Uncalibrated) & None ($29.6\%$ Unsafe) & Raw String ($68.2\%$) & $15\text{--}45\text{ ms}$ (HBM Re-Prefill) \\
 \midrule
@@ -143,11 +146,11 @@ To bridge this gap, we design and implement \textbf{Agent-Synapse}, a hardware-s
     $\bullet$ $16$-Token CoW Page Pointer in VMEM/TMEM\\
     $\bullet$ Canonical AST Match ($89.4\%$): $0\text{ ms}$ I/O Wait\\
     $\bullet$ AST Mismatch ($10.6\%$): $< 12\,\mu\text{s}$ CoW Rollback\\
-    $\bullet$ $p_{50} = 4.2\,\mu\text{s}, p_{99} = 9.8\,\mu\text{s}$ ($3{,}800\times$ vs.\ HBM)
+    $\bullet$ $p_{50} = 4.2\,\mu\text{s}, p_{99} = 9.8\,\mu\text{s}$ (over $4{,}500\times$ vs.\ HBM)
 };
 
-\draw[arrow, color=googleblue] (s1.east) -- node[above, font=\scriptsize\bfseries] {$(\hat{w}, \hat{\mathbf{a}}, C_{\text{conf}})$} (s2.west);
-\draw[arrow, color=googleyellow!80!black] (s2.east) -- node[above, font=\scriptsize\bfseries] {Prefetched Payload} (s3.west);
+\draw[arrow, color=googleblue] (s1.east) -- node[above=3pt, font=\scriptsize\bfseries] {$(\hat{w}, \hat{\mathbf{a}}, C_{\text{conf}})$} (s2.west);
+\draw[arrow, color=googleyellow!80!black] (s2.east) -- node[above=3pt, font=\scriptsize\bfseries] {Prefetched Payload} (s3.west);
 
 % Timeline comparison
 \node[anchor=west, font=\footnotesize\bfseries, color=googlered] at (-3.1, 0.2) {Serial Baseline ($842.0\text{ ms } p_{99}$):};
@@ -162,7 +165,7 @@ To bridge this gap, we design and implement \textbf{Agent-Synapse}, a hardware-s
 \draw[fill=googlegreen!28, draw=googlegreen, line width=0.9pt] (4.8, -1.30) rectangle (9.0, -0.85);
 \node[font=\scriptsize\bfseries] at (6.9, -1.075) {Overlapped Speculative Prefetch ($-61.8\%$ $p_{99}$ Tail Latency)};
 \draw[dashed, color=googlegreen, line width=1.0pt] (4.8, -0.30) -- (4.8, -1.30);
-\node[anchor=east, font=\tiny\bfseries, color=googleblue] at (4.75, -1.075) {Trigger $t_{\text{branch}}$};
+\node[above, font=\tiny\bfseries, color=googleblue] at (4.8, -0.25) {Trigger $t_{\text{branch}}$};
 \end{tikzpicture}
 \caption{Three-stage hardware-software architecture of \textbf{Agent-Synapse} and execution timeline comparison. Stage~1 detects semantic tool commitment across intermediate transformer layers $l \in [8, 16]$ at decode step $t_{\text{branch}}$ ($150$--$400\text{ ms}$ before \texttt{</tool\_call>} EOS); Stage~2 dispatches idempotent FastMCP requests asynchronously over the NIC while token decoding continues on the accelerator; Stage~3 pins a Copy-on-Write (CoW) page descriptor in on-chip SRAM and either splices the prefetched response on a canonical AST match ($89.4\%$) or rolls back in $< 12\,\mu\text{s}$ on a mismatch ($10.6\%$).}
 \label{fig:architecture}
@@ -187,10 +190,10 @@ When the agent decides to invoke an external tool during turn $j$, it emits a st
 \end{aligned}
 \label{eq:residual_stream}
 \end{equation}
-where $\tilde{\mathbf{h}}_t^{(l)} = \mathbf{h}_t^{(l-1)} + \operatorname{MHA}^{(l)}(\operatorname{RMSNorm}(\mathbf{h}_{\le t}^{(l-1)}))$ is the post-attention residual state, $\operatorname{RMSNorm}(\mathbf{z}) = \frac{\mathbf{z}}{\sqrt{\frac{1}{d_{\text{model}}}\sum_{i=1}^{d_{\text{model}}} z_i^2 + \epsilon}} \odot \mathbf{g}$ is Root-Mean-Square Layer Normalization, $\operatorname{MHA}^{(l)}$ denotes grouped-query attention~\cite{vaswani2017attention, dao2022flashattention, dao2024flashattention2}, and $\operatorname{FFN}^{(l)}$ denotes the SwiGLU feed-forward network. Under standard serving, token $y_t \sim \operatorname{Softmax}(\mathbf{W}_U \operatorname{RMSNorm}(\mathbf{h}_t^{(L)}))$ is sampled only at the final layer $L$, and the external network RPC is blocked until $t = t_{\text{eos}}$.
+where $\tilde{\mathbf{h}}_t^{(l)} = \mathbf{h}_t^{(l-1)} + \operatorname{MHA}^{(l)}(\operatorname{RMSNorm}(\mathbf{h}_{\le t}^{(l-1)}))$ is the post-attention residual state, $\operatorname{RMSNorm}(\mathbf{z}) = \frac{\mathbf{z}}{\sqrt{\frac{1}{d_{\text{model}}}\sum_{i=1}^{d_{\text{model}}} z_i^2 + \epsilon}} \odot \mathbf{g}$ is Root-Mean-Square Layer Normalization (applied token-wise across sequence positions for prefix tensors), $\operatorname{MHA}^{(l)}$ denotes grouped-query attention~\cite{vaswani2017attention, dao2022flashattention, dao2024flashattention2}, and $\operatorname{FFN}^{(l)}$ denotes the SwiGLU feed-forward network. Under standard serving, token $y_t \sim \operatorname{Softmax}(\mathbf{W}_U \operatorname{RMSNorm}(\mathbf{h}_t^{(L)}))$ is sampled only at the final layer $L$, and the external network RPC is blocked until $t = t_{\text{eos}}$.
 
 \subsection{Anatomy of Intra-Turn Token Decoding Latency}
-To understand why $150\text{ ms}$--$400\text{ ms}$ of prediction lead time consistently exists inside a tool-calling turn, we decompose the token sequence $\mathbf{y}_{t_{\text{start}} : t_{\text{eos}}}$ ($K_{\text{call}} \in [30, 71]$ tokens) into four contiguous syntactic segments:
+To understand why $150\text{ ms}$--$400\text{ ms}$ of prediction lead time consistently exists inside a tool-calling turn, we decompose the token sequence $\mathbf{y}_{t_{\text{start}} : t_{\text{eos}}}$ ($K_{\text{call}} \in [25, 70]$ tokens) into four contiguous syntactic segments:
 \begin{equation}
 \mathbf{y}_{t_{\text{start}} : t_{\text{eos}}} = \underbrace{\mathbf{y}_{\text{prefix}}}_{\text{3--5 tokens}} \,\parallel\, \underbrace{\mathbf{y}_{\text{name}}}_{\text{4--9 tokens}} \,\parallel\, \underbrace{\mathbf{y}_{\text{req\_args}}}_{\text{8--22 tokens}} \,\parallel\, \underbrace{\mathbf{y}_{\text{suffix}}}_{\text{15--35 tokens}},
 \label{eq:token_decomposition}
@@ -304,7 +307,7 @@ By definition, $P_{\textnormal{attn}}(w_k \mid \mathbf{h}_{\le t}) \le p_{\max}(
 H_{\textnormal{attn}}^{(8:16)}(t) \ln M = \sum_{k=1}^M P_{\textnormal{attn}}(w_k) \ln\!\left(\frac{1}{P_{\textnormal{attn}}(w_k)}\right) \ge \ln\!\left(\frac{1}{p_{\max}(t)}\right),
 $}
 \end{equation}
-where equality holds when $1/p_{\max}(t)$ is an integer and $P_{\textnormal{attn}}$ is uniform on $1/p_{\max}(t)$ schemas of equal mass $p_{\max}(t)$ (which minimizes Shannon entropy for a given max-probability by Schur-concavity). Exponentiating and applying the entropy filter $H_{\textnormal{attn}}^{(8:16)}(t) \le H_{\max}$ yields $p_{\max}(t) \ge \exp(-H_{\max} \ln M) = M^{-H_{\max}}$, establishing Eq.~\eqref{eq:renyi_min_bound}.
+where equality holds when $1/p_{\max}(t)$ is an integer and $P_{\textnormal{attn}}$ is uniform on $1/p_{\max}(t)$ schemas of equal mass $p_{\max}(t)$ in the limit as smoothing $\epsilon_{\text{smooth}} \to 0$ (which minimizes Shannon entropy for a given max-probability by Schur-concavity). Exponentiating and applying the entropy filter $H_{\textnormal{attn}}^{(8:16)}(t) \le H_{\max}$ yields $p_{\max}(t) \ge \exp(-H_{\max} \ln M) = M^{-H_{\max}}$, establishing Eq.~\eqref{eq:renyi_min_bound}.
 For Eq.~\eqref{eq:fano_entropy_envelope}, Fano's inequality and the chain rule of entropy show that for any $M$-ary distribution with max-probability $p_{\max}$, the Shannon entropy is upper-bounded by $H(P) \le g_M(p_{\max}) = h_2(p_{\max}) + (1 - p_{\max}) \ln(M-1)$. The derivative $g_M'(p) = \ln((1-p)/p) - \ln(M-1) = \ln\big(\frac{1-p}{p(M-1)}\big) < 0$ for all $p \in (1/M, 1]$, so $g_M$ is strictly decreasing and its inverse $g_M^{-1} : [0, \ln M] \to [1/M, 1]$ is uniquely defined. Under worst-case residual dispersion, $H_{\textnormal{attn}}^{(8:16)}(t) \ln M = g_M(p_{\max}(t)) \le H_{\max} \ln M \iff p_{\max}(t) \ge g_M^{-1}(H_{\max} \ln M)$, completing the proof.
 \end{proof}
 
@@ -317,7 +320,7 @@ To extract the predicted tool identifier and structured argument tokens prior to
 \label{eq:logit_lens}
 \end{equation}
 
-Importantly, Stage~1 does \emph{not} need to compute the full dense matrix-vector product $\mathbf{W}_U \in \mathbb{R}^{|\mathcal{V}| \times d_{\text{model}}}$ across all $|\mathcal{V}| \approx 128{,}256$ vocabulary tokens at intermediate layers. Instead, during tool-identifier detection, Stage~1 restricts the projection to the active subword trie $\mathcal{V}_{\mathcal{W}} = \bigcup_{k=1}^M \operatorname{Anchor}(w_k)$ containing only the unique anchor tokens of the $M$ registered tools ($|\mathcal{V}_{\mathcal{W}}| \le 4M \ll |\mathcal{V}|$). This sub-matrix projection $\mathbf{W}_{U, \mathcal{V}_{\mathcal{W}}} \in \mathbb{R}^{|\mathcal{V}_{\mathcal{W}}| \times d_{\text{model}}}$ reduces floating-point operations at each monitored early layer by over $500\times$, executing in $< 35\,\mu\text{s}$ on a single TPU v6e VPU or NVIDIA B200 Tensor Core slice.
+Importantly, Stage~1 does \emph{not} need to compute the full dense matrix-vector product $\mathbf{W}_U \in \mathbb{R}^{|\mathcal{V}| \times d_{\text{model}}}$ across all $|\mathcal{V}| = 256{,}000$ vocabulary tokens at intermediate layers. Instead, during tool-identifier detection, Stage~1 restricts the projection to the active subword trie $\mathcal{V}_{\mathcal{W}} = \bigcup_{k=1}^M \{u_{k,1}, \dots, u_{k,m_k}\}$ containing only the unique anchor tokens of the $M$ registered tools ($|\mathcal{V}_{\mathcal{W}}| \le 4M \ll |\mathcal{V}|$). This sub-matrix projection $\mathbf{W}_{U, \mathcal{V}_{\mathcal{W}}} \in \mathbb{R}^{|\mathcal{V}_{\mathcal{W}}| \times d_{\text{model}}}$ reduces floating-point operations at each monitored early layer by over $500\times$, executing in $< 35\,\mu\text{s}$ on a single TPU v6e VPU or NVIDIA B200 Tensor Core slice.
 
 For each candidate tool $w_k \in \mathcal{W}$ with anchor subword sequence $\operatorname{Anchor}(w_k) = (u_{k,1}, \dots, u_{k,m_k})$, let $z_t^{(l)}(\operatorname{Anchor}(w_k)) = \frac{1}{m_k} \sum_{r=1}^{m_k} \ln P_{\mathcal{V}_{\mathcal{W}}}^{(l)}(u_{k,r} \mid \mathbf{h}_{t_{\text{name}}+r-1}^{(l)})$ denote the length-normalized subword log-probability at layer $l$. Aggregating across $\mathcal{L}_{\text{early}}$ with layer decay $\gamma_{\text{layer}}^{l_{\max} - l}$ yields the fused logit-lens score:
 \begin{equation}
@@ -326,24 +329,24 @@ For each candidate tool $w_k \in \mathcal{W}$ with anchor subword sequence $\ope
 \end{equation}
 and applying a temperature-scaled softmax ($\tau_{\text{temp}} = 1.0$) produces the logit-lens posterior:
 \begin{equation}
-P_{\text{lens}}\!\left(w_k \mid \mathbf{h}_t^{(8:16)}\right) = \frac{\exp\!\left(\bar{z}_t(w_k) - \max_{j} \bar{z}_t(w_j)\right)}{\sum_{j=1}^M \exp\!\left(\bar{z}_t(w_j) - \max_{j'} \bar{z}_t(w_{j'})\right)}.
+P_{\text{lens}}\!\left(w_k \mid \mathbf{h}_{\le t}^{(8:16)}\right) = \frac{\exp\!\left(\bar{z}_t(w_k) - \max_{j} \bar{z}_t(w_j)\right)}{\sum_{j=1}^M \exp\!\left(\bar{z}_t(w_j) - \max_{j'} \bar{z}_t(w_{j'})\right)}.
 \label{eq:lens_posterior}
 \end{equation}
 
 We combine the logit-lens posterior with cross-attention support to obtain the fused tool probability:
 \begin{equation}
 \resizebox{0.88\columnwidth}{!}{$\displaystyle
-P_{\text{fused}}(w_k \mid \mathbf{h}_{\le t}^{(8:16)}) = \lambda_{\text{lens}} P_{\text{lens}}(w_k \mid \mathbf{h}_t^{(8:16)}) + (1 - \lambda_{\text{lens}}) P_{\text{attn}}(w_k \mid \mathbf{h}_{\le t}),
+P_{\text{fused}}(w_k \mid \mathbf{h}_{\le t}^{(8:16)}) = \lambda_{\text{lens}} P_{\text{lens}}(w_k \mid \mathbf{h}_{\le t}^{(8:16)}) + (1 - \lambda_{\text{lens}}) P_{\text{attn}}(w_k \mid \mathbf{h}_{\le t}),
 $}
 \label{eq:fused_posterior}
 \end{equation}
 with $\lambda_{\text{lens}} = 0.70$, and select the top candidate $\hat{w} = \arg\max_{w_k \in \mathcal{W}} P_{\text{fused}}(w_k \mid \mathbf{h}_{\le t}^{(8:16)})$.
 
-Simultaneously, for each required parameter $a_r \in \mathcal{A}_{\text{req}}(\hat{w})$ whose value tokens $\hat{\mathbf{v}}_r = (v_{r,1}, \dots, v_{r,d_r})$ have been decoded at historical steps $t_{r,j} \le t$ (or projected via layer-$l_{\max}$ lookahead) with per-token probabilities $p_{t_{r,j}}(v_{r,j})$, we compute the geometric-mean argument token confidence and inter-layer agreement stability $C_{\text{arg}}(t) \in [0, 1]$:
+Simultaneously, for each required parameter $a_r \in \mathcal{A}_{\text{req}}(\hat{w})$ whose value tokens $\hat{\mathbf{v}}_r = (v_{r,1}, \dots, v_{r,d_r})$ have been decoded at historical steps $t_{r,j} \le t$ (or projected via layer-$l_{\max}$ lookahead) with per-token probabilities $p_{t_{r,j}}(v_{r,j})$, we compute the geometric-mean argument token confidence across the $D_{\text{req}} = \sum_{r=1}^{|\mathcal{A}_{\text{req}}(\hat{w})|} d_r$ total required value tokens and combine it with inter-layer agreement stability to yield $C_{\text{arg}}(t) \in [0, 1]$:
 \begin{equation}
 \begin{aligned}
-C_{\text{arg}}(t) &= 0.65 \left( \prod_{r=1}^{|\mathcal{A}_{\text{req}}(\hat{w})|} \prod_{j=1}^{d_r} p_{t_{r,j}}(v_{r,j}) \right)^{\!\frac{1}{\sum_r d_r}} \\
-&\quad + 0.35 \left( \frac{1}{|\mathcal{L}_{\text{early}}|} \sum_{l \in \mathcal{L}_{\text{early}}} \mathbb{I}\!\left[\arg\max_{w} \mathbf{z}_t^{(l)}(w) = \hat{w}\right] \right).
+C_{\text{arg}}(t) &= 0.65 \left( \prod_{r=1}^{|\mathcal{A}_{\text{req}}(\hat{w})|} \prod_{j=1}^{d_r} p_{t_{r,j}}(v_{r,j}) \right)^{\!\frac{1}{D_{\text{req}}}} \\
+&\quad + 0.35 \left( \frac{1}{|\mathcal{L}_{\text{early}}|} \sum_{l \in \mathcal{L}_{\text{early}}} \mathbb{I}\!\left[\arg\max_{w} \mathbf{z}_t^{(l)}(\operatorname{Anchor}(w)) = \hat{w}\right] \right).
 \end{aligned}
 \label{eq:arg_stability}
 \end{equation}
@@ -362,29 +365,29 @@ and define the corresponding conformal confidence $C_{\text{conf}}(t) = 1 - s(x,
 
 \begin{theorem}[Conformal Risk Control of Early-Exit Speculative Tool Dispatches]
 \label{thm:conformal}
-Let $\mathcal{D}_{\textnormal{cal}} = \{(x_i, y_i^*)\}_{i=1}^{n_{\textnormal{cal}}}$ be an exchangeable calibration dataset of $n_{\textnormal{cal}}$ agent tool-calling traces where $y_i^* = (w_i^*, \mathbf{a}_i^*)$ denotes the canonical ground-truth tool call emitted at $t_{\textnormal{eos}}$. For any trace $i$, let $t_i = \min\{t \in [t_{\textnormal{start}}, t_{\textnormal{eos}}) : H_{\textnormal{attn}}^{(8:16)}(t) \le H_{\max} \wedge \mathcal{A}_{\textnormal{req}}(\hat{w}_t) \subseteq \operatorname{dom}(\hat{\mathbf{a}}_t)\}$ denote the deterministic candidate stopping step, with prediction $\hat{y}_i = (\hat{w}_{t_i}, \hat{\mathbf{a}}_{t_i})$. For any dispatch confidence threshold $\tau \in [0, 1]$, define the binary dispatch decision $\operatorname{Dispatch}(x, \tau) = \mathbb{I}[C_{\textnormal{conf}}(x) \ge \tau]$ and the False Discovery Rate (FDR) loss:
+Let $\mathcal{D}_{\textnormal{cal}} = \{(x_i, y_i^*)\}_{i=1}^{n_{\textnormal{cal}}}$ be an exchangeable calibration dataset of $n_{\textnormal{cal}}$ agent tool-calling traces where $y_i^* = (w_i^*, \mathbf{a}_i^*)$ denotes the canonical ground-truth tool call emitted at $t_{\textnormal{eos}}$. For any trace $i$ and confidence threshold $\tau \in \mathcal{T}_{\textnormal{grid}} \subset [0, 1]$ (where candidate triggers satisfy $n_{\textnormal{trig}}(\tau) \ge n_{\min} > 0$), let $t_i(\tau) = \min\{t \in [t_{\textnormal{start}}, t_{\textnormal{eos}}) : H_{\textnormal{attn}}^{(8:16)}(t) \le H_{\max} \wedge \mathcal{A}_{\textnormal{req}}(\hat{w}_t) \subseteq \operatorname{dom}(\hat{\mathbf{a}}_t) \wedge C_{\textnormal{conf}}(t) \ge \tau\}$ denote the stopping step (setting $t_i = t_{\textnormal{eos}}$ and $\operatorname{Dispatch}=0$ if the stopping set is empty), with prediction $\hat{y}_i(\tau) = (\hat{w}_{t_i}, \hat{\mathbf{a}}_{t_i})$. Define the binary dispatch decision $\operatorname{Dispatch}(x_i, \tau) = \mathbb{I}[C_{\textnormal{conf}}(t_i(\tau)) \ge \tau]$ and the False Discovery Rate (FDR) loss:
 \begin{equation}
-L(\tau; x, y^*) = \frac{\mathbb{I}\!\left[\operatorname{Dispatch}(x, \tau) = 1 \wedge \operatorname{AST}(\hat{y}) \ne \operatorname{AST}(y^*)\right]}{\max\left(1, \; \mathbb{I}\!\left[\operatorname{Dispatch}(x, \tau) = 1\right]\right)}.
+L(\tau; x, y^*) = \frac{\mathbb{I}\!\left[\operatorname{Dispatch}(x, \tau) = 1 \wedge \operatorname{AST}(\hat{y}(\tau)) \ne \operatorname{AST}(y^*)\right]}{\max\left(1, \; \mathbb{I}\!\left[\operatorname{Dispatch}(x, \tau) = 1\right]\right)}.
 \end{equation}
 Then:
 \begin{enumerate}
-    \item \textbf{Selective False-Dispatch Risk Control via CRC:} Defining the empirical false-dispatch risk with Laplace smoothing:
+    \item \textbf{Selective False-Dispatch Risk Control via CRC:} Defining the empirical false-dispatch risk over $\mathcal{T}_{\textnormal{grid}}$ with Laplace smoothing:
     \begin{equation}
-    \hat{R}(\tau) = \frac{\sum_{i=1}^{n_{\textnormal{cal}}} \mathbb{I}\!\left[C_{\textnormal{conf}}(x_i) \ge \tau \wedge \operatorname{AST}(\hat{y}_i) \ne \operatorname{AST}(y_i^*)\right] + 1}{\sum_{i=1}^{n_{\textnormal{cal}}} \mathbb{I}\!\left[C_{\textnormal{conf}}(x_i) \ge \tau\right] + 1},
+    \hat{R}(\tau) = \frac{\sum_{i=1}^{n_{\textnormal{cal}}} \mathbb{I}\!\left[\operatorname{Dispatch}(x_i, \tau) = 1 \wedge \operatorname{AST}(\hat{y}_i(\tau)) \ne \operatorname{AST}(y_i^*)\right] + 1}{\sum_{i=1}^{n_{\textnormal{cal}}} \mathbb{I}\!\left[\operatorname{Dispatch}(x_i, \tau) = 1\right] + 1},
     \end{equation}
-    the calibrated threshold $\tau_{\textnormal{conf}}(\alpha) = \inf\{\tau \in [0,1] : \hat{R}(\tau') \le \alpha,\; \forall \tau' \ge \tau\}$ guarantees under Conformal Risk Control~\cite{angelopoulos2023conformal} that for an exchangeable test trace $(X_{\textnormal{test}}, Y_{\textnormal{test}}^*)$:
+    the calibrated threshold $\tau_{\textnormal{conf}}(\alpha) = \inf\{\tau \in \mathcal{T}_{\textnormal{grid}} : \hat{R}(\tau') \le \alpha,\; \forall \tau' \ge \tau\}$ guarantees under Conformal Risk Control~\cite{angelopoulos2023conformal} that for an exchangeable test trace $(X_{\textnormal{test}}, Y_{\textnormal{test}}^*)$:
     \begin{equation}
     \mathbb{E}\!\left[ L(\tau_{\textnormal{conf}}(\alpha); X_{\textnormal{test}}, Y_{\textnormal{test}}^*) \right] \le \alpha + \mathcal{O}\!\left(\frac{1}{\sqrt{n_{\textnormal{cal}}}}\right),
     \label{eq:conformal_fdr_bound}
     \end{equation}
     bounding the expected conditional speculative mismatch rate $1 - \eta \le \alpha$.
-    \item \textbf{Positive-Class Recall Coverage:} Let $s_{(1)} \le \dots \le s_{(n_+)}$ be the order statistics of nonconformity scores $s_i = 1 - C_{\textnormal{conf}}(x_i)$ on the positive calibration subset $\mathcal{I}_+ = \{i : \operatorname{AST}(\hat{y}_i) = \operatorname{AST}(y_i^*)\}$. Setting $\hat{q}_{1-\beta} = s_{(\lceil (n_+ + 1)(1 - \beta) \rceil)}$ ensures marginal positive-class coverage $\mathbb{P}(C_{\textnormal{conf}}(X_{\textnormal{test}}) \ge 1 - \hat{q}_{1-\beta} \mid \operatorname{AST}(\hat{Y}_{\textnormal{test}}) = \operatorname{AST}(Y_{\textnormal{test}}^*)) \ge 1 - \beta$.
+    \item \textbf{Positive-Class Recall Coverage:} Let $s_{(1)} \le \dots \le s_{(n_+)}$ be the order statistics of nonconformity scores $s_i = 1 - C_{\textnormal{conf}}(x_i)$ on the positive calibration subset $\mathcal{I}_+ = \{i : \operatorname{AST}(\hat{y}_i) = \operatorname{AST}(y_i^*)\}$. Setting the recall threshold $\tau_{\textnormal{recall}}(\beta) = 1 - s_{(\lceil (n_+ + 1)(1 - \beta) \rceil)}$ ensures marginal positive-class coverage $\mathbb{P}(C_{\textnormal{conf}}(X_{\textnormal{test}}) \ge \tau_{\textnormal{recall}}(\beta) \mid \operatorname{AST}(\hat{Y}_{\textnormal{test}}) = \operatorname{AST}(Y_{\textnormal{test}}^*)) \ge 1 - \beta$.
 \end{enumerate}
 \end{theorem}
 
 \begin{proof}
-For Part~(1), the per-trace loss $L(\tau; x_i, y_i^*) \in [0, 1]$ is monotonically non-increasing in $\tau$ because the dispatch set $\{x : C_{\textnormal{conf}}(x) \ge \tau\}$ contracts monotonically as $\tau$ increases. Because the calibration traces $\mathcal{D}_{\textnormal{cal}}$ and test trace $(X_{\textnormal{test}}, Y_{\textnormal{test}}^*)$ are exchangeable, the empirical risk $\hat{R}(\tau)$ with the $+1$ Laplace correction constitutes an admissible upper-confidence bound on the population risk $\mathbb{E}[L(\tau)]$. Applying the Conformal Risk Control framework (Angelopoulos et al.~\cite{angelopoulos2023conformal}, Theorem~1) ensures that the stopping threshold $\tau_{\textnormal{conf}}(\alpha)$ controls the expected risk $\mathbb{E}[L(\tau_{\textnormal{conf}}(\alpha))] \le \alpha$, establishing Eq.~\eqref{eq:conformal_fdr_bound}. At $\alpha = 0.10$ on $n_{\textnormal{cal}} = 500$ held-out traces, $\tau_{\textnormal{conf}}(0.10) = 0.82$, yielding an empirical conditional false-dispatch rate of $1 - \eta = 10.6\%$ on the held-out test suite.
-For Part~(2), because $t_i$ is a deterministic stopping rule applied identically across exchangeable traces, the positive scores $\{s_i : i \in \mathcal{I}_+\}$ and $s_{\textnormal{test}}$ conditioned on AST equivalence are exchangeable random variables in $[0, 1]$~\cite{shafer2008tutorial}. The rank of $s_{\textnormal{test}}$ among the $n_+ + 1$ values is uniform on $\{1, \dots, n_+ + 1\}$, giving $\mathbb{P}(s_{\textnormal{test}} \le \hat{q}_{1-\beta}) = \frac{\lceil (n_+ + 1)(1 - \beta) \rceil}{n_+ + 1} \ge 1 - \beta$.
+For Part~(1), the per-trace loss $L(\tau; x_i, y_i^*) \in [0, 1]$ is monotonically non-increasing in $\tau$ because the dispatch set $\{x : C_{\textnormal{conf}}(x) \ge \tau\}$ contracts monotonically as $\tau$ increases. Evaluating over the admissible grid $\mathcal{T}_{\textnormal{grid}} \subset [0, \tau_{\max}]$ where $n_{\textnormal{trig}}(\tau) \ge n_{\min} > 0$ avoids empty-denominator degeneracy. Because calibration traces $\mathcal{D}_{\textnormal{cal}}$ and test trace $(X_{\textnormal{test}}, Y_{\textnormal{test}}^*)$ are exchangeable, empirical risk $\hat{R}(\tau)$ with Laplace smoothing constitutes an admissible upper-confidence bound on population risk $\mathbb{E}[L(\tau)]$. Applying the Conformal Risk Control framework (Angelopoulos et al.~\cite{angelopoulos2023conformal}, Theorem~1) ensures that the stopping threshold $\tau_{\textnormal{conf}}(\alpha)$ controls expected risk $\mathbb{E}[L(\tau_{\textnormal{conf}}(\alpha))] \le \alpha$, establishing Eq.~\eqref{eq:conformal_fdr_bound}. At $\alpha = 0.10$ on $n_{\textnormal{cal}} = 500$ held-out traces, $\tau_{\textnormal{conf}}(0.10) = 0.82$, yielding an empirical conditional false-dispatch rate of $1 - \eta = 10.6\%$ on the held-out test suite.
+For Part~(2), because $t_i$ is a deterministic stopping rule applied identically across exchangeable traces, positive scores $\{s_i : i \in \mathcal{I}_+\}$ and $s_{\textnormal{test}}$ conditioned on AST equivalence are exchangeable random variables in $[0, 1]$~\cite{shafer2008tutorial}. The rank of $s_{\textnormal{test}}$ among the $n_+ + 1$ values is uniform on $\{1, \dots, n_+ + 1\}$, giving $\mathbb{P}(s_{\textnormal{test}} \le 1 - \tau_{\textnormal{recall}}(\beta)) = \frac{\lceil (n_+ + 1)(1 - \beta) \rceil}{n_+ + 1} \ge 1 - \beta$.
 \end{proof}
 
 When $H_{\text{attn}}^{(8:16)}(t) \le 0.72$, $C_{\text{conf}}(t) \ge \tau_{\text{conf}} = 0.82$ (calibrated at $\alpha = 0.10$ on $n_{\text{cal}} = 500$ held-out calibration traces), and all required parameters $\mathcal{A}_{\text{req}}(\hat{w})$ are populated, Stage~1 fires a speculative prefetch trigger with estimated lead time $T_{\text{lead}} = (t_{\text{eos}} - t_{\text{branch}}) \cdot \tau_{\text{tok}} \in [150\text{ ms}, 400\text{ ms}]$.
@@ -406,11 +409,12 @@ Because a nominally read-only SQL or ISO GQL endpoint could still receive an adv
 \begin{equation}
 \begin{aligned}
 \mathcal{K}_{\text{DML}} = \{&\texttt{INSERT}, \texttt{UPDATE}, \texttt{DELETE}, \texttt{DROP}, \texttt{ALTER}, \\
-&\texttt{TRUNCATE}, \texttt{MERGE}, \texttt{CREATE}, \texttt{GRANT}, \texttt{REVOKE}\}.
+&\texttt{TRUNCATE}, \texttt{MERGE}, \texttt{CREATE}, \texttt{GRANT}, \texttt{REVOKE}, \\
+&\texttt{SET}, \texttt{REMOVE}, \texttt{DETACH}, \texttt{REPLACE}, \texttt{UPSERT}, \texttt{CALL}, \texttt{EXECUTE}\}.
 \end{aligned}
 \label{eq:dml_keywords}
 \end{equation}
-If $\operatorname{HasMutatingDML}(\hat{\mathbf{a}}) = \text{True}$ or $\kappa(\hat{w}) = \texttt{MUTATING\_BLOCKED}$, Stage~2 unconditionally blocks speculative dispatch ($0\text{ bytes}$ transmitted on the wire prior to $t_{\text{eos}}$) and defers execution to the standard post-EOS verified path.
+covering both ANSI SQL mutation verbs and ISO GQL property/label mutation clauses (\texttt{SET}, \texttt{REMOVE}, \texttt{DETACH}) as well as stored procedure invocations (\texttt{CALL}, \texttt{EXECUTE}). If $\operatorname{HasMutatingDML}(\hat{\mathbf{a}}) = \text{True}$ or $\kappa(\hat{w}) = \texttt{MUTATING\_BLOCKED}$, Stage~2 unconditionally blocks speculative dispatch ($0\text{ bytes}$ transmitted on the wire prior to $t_{\text{eos}}$) and defers execution to the standard post-EOS verified path.
 
 \subsection{Speculative FastMCP Wire Frame and Header Specification}
 For approved speculative requests ($\kappa(\hat{w}) \in \{\texttt{READ\_ONLY}, \texttt{IDEMPOTENT\_DRY\_RUN}\}$ and $\operatorname{HasMutatingDML}(\hat{\mathbf{a}}) = \text{False}$), Stage~2 serializes a JSON-RPC 2.0 / HTTP/2 request frame and dispatches it asynchronously over the host NIC with five deterministic HTTP/2 wire headers:
@@ -460,7 +464,7 @@ For enterprise tools classified as $\kappa(w) = \texttt{IDEMPOTENT\_DRY\_RUN}$--
 \begin{enumerate}
     \item Upon receiving \texttt{X-Synapse-Dry-Run-Mode: SNAPSHOT\_READ\_ONLY}, the downstream database proxy binds the speculative execution to a TrueTime read-only snapshot timestamp $t_{\text{snap}} = \operatorname{now}()$~\cite{corbett2012spanner}, acquiring zero shared or exclusive locks and generating zero redo/undo log records.
     \item The database evaluates all schema constraints, account balance invariants, and tax calculation rules against $\Sigma_{\text{db}}(t_{\text{snap}})$ and returns a signed validation pre-receipt $(\text{status}, \Delta_{\text{sim}}, t_{\text{snap}}, \sigma_{\text{db}})$ to the Stage~3 shadow buffer while the LLM is still decoding the closing tokens of the tool call.
-    \item Once \texttt{</tool\_call>} EOS is emitted and canonical AST equivalence is verified ($h_{\text{AST}}(\hat{w}, \hat{\mathbf{a}}) = h_{\text{AST}}(w^*, \mathbf{a}^*)$), the pre-validated dry-run result is immediately spliced into the KV-cache in $2.1\,\mu\text{s}$. If the prediction diverges, the pre-receipt is simply discarded with zero rollback RPC required on the database server.
+    \item Once \texttt{</tool\_call>} EOS is emitted and canonical AST equivalence is verified ($h_{\text{AST}}(\hat{w}, \hat{\mathbf{a}}) = h_{\text{AST}}(w^*, \mathbf{a}^*)$), the pre-validated dry-run result is immediately spliced into the KV-cache in $2.1\,\mu\text{s}$. If the prediction diverges, the pre-receipt is simply discarded with zero rollback RPC required on the database server. Because \texttt{IDEMPOTENT\_DRY\_RUN} tools are strictly side-effect-free simulation endpoints, any subsequent state commit occurs in a separate, non-speculative \texttt{MUTATING\_BLOCKED} turn that verifies MVCC read-set conflict serializability against $t_{\text{snap}}$.
 \end{enumerate}
 
 \begin{theorem}[Observational Non-Interference and Idempotency Safety of Speculative Prefetching]
@@ -476,7 +480,7 @@ Let $\Sigma_{\textnormal{db}}^{(t_{\textnormal{start}})}$ denote the committed s
 We establish observational equivalence across both components of $\mathcal{O}_{\textnormal{ext}}$:
 \begin{enumerate}
     \item \emph{External Database State Invariance ($\Sigma_{\textnormal{db}}^{(t_{\textnormal{eos}})} = \Sigma_{\textnormal{db}}^{(t_{\textnormal{start}})}$):} By construction of the Stage~2 gate, any tool $\hat{w}$ with $\kappa(\hat{w}) = \texttt{MUTATING\_BLOCKED}$ or any argument payload satisfying $\operatorname{HasMutatingDML}(\hat{\mathbf{a}}) = \text{True}$ is rejected prior to socket transmission, inducing the identity transition $\Sigma_{\textnormal{db}}^{(t_{\textnormal{eos}})} = \Sigma_{\textnormal{db}}^{(t_{\textnormal{start}})}$. Conversely, if $(\hat{w}, \hat{\mathbf{a}})$ passes the gate, then either (a) $\kappa(\hat{w}) = \texttt{READ\_ONLY}$ and $\hat{\mathbf{a}}$ contains no DML/DDL verbs, so backend execution is a pure mathematical function $f_{\hat{w}}: \Sigma_{\textnormal{db}} \times \mathcal{A} \to \mathcal{R}$ that leaves $\Sigma_{\textnormal{db}}$ invariant, or (b) $\kappa(\hat{w}) = \texttt{IDEMPOTENT\_DRY\_RUN}$ and the request carries \texttt{X-Synapse-Dry-Run-Mode: SNAPSHOT\_READ\_ONLY}, which executes over an immutable MVCC snapshot timestamp $t_{\textnormal{snap}} \le t_{\textnormal{branch}}$ without mutating $\Sigma_{\textnormal{db}}$~\cite{corbett2012spanner}. Thus $\Sigma_{\textnormal{db}}^{(t_{\textnormal{eos}})} = \Sigma_{\textnormal{db}}^{(t_{\textnormal{start}})}$ holds unconditionally.
-    \item \emph{Accelerator KV-Cache Prefix Equivalence ($\mathcal{K}_{\textnormal{committed}}^{(t_{\textnormal{eos}})} = \mathcal{K}_{1:t_{\textnormal{eos}}}^{\textnormal{serial}}$):} During steps $t \in [t_{\textnormal{branch}}+1, t_{\textnormal{eos}}]$, the ongoing autoregressive suffix tokens $\mathbf{y}_{t_{\textnormal{branch}}+1 : t_{\textnormal{eos}}}$ are written to committed suffix pages $\mathcal{P}_{\textnormal{suffix}} = (p_{N_{\textnormal{base}}}, \dots, p_{N_{\textnormal{eos}}-1})$, while any pre-staged speculative tool response tokens are written exclusively into Copy-on-Write shadow pages $\mathcal{P}_{\textnormal{shadow}}$ disjoint from $\mathcal{P}_{\textnormal{base}} \parallel \mathcal{P}_{\textnormal{suffix}}$. Because autoregressive self-attention for tokens $t \in [t_{\textnormal{branch}}+1, t_{\textnormal{eos}}]$ masks out $\mathcal{P}_{\textnormal{shadow}}$, the emitted token distribution $P(y_t \mid \mathbf{y}_{<t}, \mathbf{x}_{1:t_0})$ is bitwise identical to serial decoding. Upon detecting $\operatorname{AST}(\hat{w}, \hat{\mathbf{a}}) \neq \operatorname{AST}(w^*, \mathbf{a}^*)$ at $t_{\textnormal{eos}}$, Stage~3 restores $\mathcal{P}_{\textnormal{SRAM}} \leftarrow \mathcal{P}_{\textnormal{base}} \parallel \mathcal{P}_{\textnormal{suffix}}$, unmapping $\mathcal{P}_{\textnormal{shadow}}$ in $O(1)$ time while preserving the complete emitted tool call $\mathcal{K}_{1:t_{\textnormal{eos}}}^{\textnormal{serial}}$.
+    \item \emph{Accelerator KV-Cache Prefix Equivalence ($\mathcal{K}_{\textnormal{committed}}^{(t_{\textnormal{eos}})} = \mathcal{K}_{1:t_{\textnormal{eos}}}^{\textnormal{serial}}$):} During steps $t \in [t_{\textnormal{branch}}+1, t_{\textnormal{eos}}]$, the ongoing autoregressive suffix tokens $\mathbf{y}_{t_{\textnormal{branch}}+1 : t_{\textnormal{eos}}}$ are written to committed suffix pages $\mathcal{P}_{\textnormal{suffix}} = (p_{N_{\textnormal{base}}}, \dots, p_{N_{\textnormal{eos}}-1})$, while any pre-staged speculative tool response tokens are written exclusively into Copy-on-Write shadow pages $\mathcal{P}_{\textnormal{shadow}}$ disjoint from $\mathcal{P}_{\textnormal{base}} \parallel \mathcal{P}_{\textnormal{suffix}}$. Because autoregressive self-attention for tokens $t \in [t_{\textnormal{branch}}+1, t_{\textnormal{eos}}]$ masks out $\mathcal{P}_{\textnormal{shadow}}$ and decode kernel launches are strictly isolated from background shadow prefill compute, the emitted token distribution $P(y_t \mid \mathbf{y}_{<t}, \mathbf{x}_{1:t_0})$ is bitwise identical (and distributionally identical up to floating-point reduction order) to serial decoding. Upon detecting $\operatorname{AST}(\hat{w}, \hat{\mathbf{a}}) \neq \operatorname{AST}(w^*, \mathbf{a}^*)$ at $t_{\textnormal{eos}}$, Stage~3 restores $\mathcal{P}_{\textnormal{SRAM}} \leftarrow \mathcal{P}_{\textnormal{base}} \parallel \mathcal{P}_{\textnormal{suffix}}$, unmapping $\mathcal{P}_{\textnormal{shadow}}$ in $< 12\,\mu\text{s}$ ($4.2\,\mu\text{s}$ $p_{50}$) via hardware page-descriptor restore while preserving the complete emitted tool call $\mathcal{K}_{1:t_{\textnormal{eos}}}^{\textnormal{serial}}$.
 \end{enumerate}
 Combining (1) and (2) proves Eq.~\eqref{eq:noninterference}.
 \end{proof}
@@ -494,13 +498,13 @@ Rather than cloning the multi-megabyte physical KV tensors in HBM, Stage~3 alloc
 \mathcal{D}_{\text{chk}} = \left\langle \text{id}_{\text{chk}},\, h_{\text{chk}},\, t_{\text{branch}},\, \mathcal{P}_{\text{base}},\, \mathcal{P}_{\text{suffix}},\, \mathcal{P}_{\text{shadow}},\, t_{\text{ns}} \right\rangle,
 \label{eq:checkpoint_desc}
 \end{equation}
-where $\mathcal{P}_{\text{base}} = (p_0, \dots, p_{N_{\text{base}}-1})$ freezes the base page frame pointers at $t_{\text{branch}}$, $\mathcal{P}_{\text{suffix}}$ tracks the suffix pages appended during steps $t \in [t_{\text{branch}}+1, t_{\text{eos}}]$, $\mathcal{P}_{\text{shadow}} = (s_1, \dots, s_{N_{\text{spec}}})$ allocates $N_{\text{spec}} = \lceil K_{\text{spec}} / B_{\text{page}} \rceil$ Copy-on-Write shadow page frames to receive the pre-tokenized and chunk-prefilled speculative tool response payload as soon as the Stage~2 network RPC returns, and $h_{\text{chk}} = \operatorname{SHA-256}(\text{accel} \parallel t_{\text{branch}} \parallel \mathcal{P}_{\text{base}})$ is the cryptographic checkpoint hash computed at $t_{\text{branch}}$ and transmitted in \texttt{X-Synapse-Checkpoint-Hash}.
+where $\mathcal{P}_{\text{base}} = (p_0, \dots, p_{N_{\text{base}}-1})$ freezes the base page frame pointers at $t_{\text{branch}}$, $\mathcal{P}_{\text{suffix}}$ tracks the suffix pages appended during steps $t \in [t_{\text{branch}}+1, t_{\text{eos}}]$, $\mathcal{P}_{\text{shadow}} = (s_1, \dots, s_{N_{\text{spec}}})$ reserves $N_{\text{spec}} = \lceil K_{\text{spec}} / B_{\text{page}} \rceil$ Copy-on-Write shadow page descriptor entries in on-chip SRAM (whose physical HBM frames are allocated upon response arrival) to receive the pre-tokenized and chunk-prefilled speculative tool response payload as soon as the Stage~2 network RPC returns, and $h_{\text{chk}} = \operatorname{SHA-256}(\text{accel} \parallel t_{\text{branch}} \parallel \mathcal{P}_{\text{base}})$ is the cryptographic checkpoint hash computed at $t_{\text{branch}}$ and transmitted in \texttt{X-Synapse-Checkpoint-Hash}.
 
 \subsection{Hardware Microarchitectural Execution on Cloud TPU v6e VMEM/CMEM vs.\ NVIDIA B200 TMEM}
 To achieve $< 12\,\mu\text{s}$ rollback latency ($p_{50} = 4.2\,\mu\text{s}, p_{99} = 9.8\,\mu\text{s}$), Stage~3 maps the Copy-on-Write page table directly onto the hardware descriptor primitives of each accelerator architecture:
 \begin{enumerate}
-    \item \textbf{Cloud TPU v6e (Trillium) VMEM/CMEM DMA Descriptor Path:} On TPU v6e, the sequence block table $\mathcal{P}_{\text{SRAM}}$ resides in a dedicated $64\text{ KiB}$ region of Scalar/Vector Memory (VMEM). When Stage~1 triggers at $t_{\text{branch}}$, the VPU executes a single vectorized register move (\texttt{vmov.u32}) copying the active descriptor vector $\mathcal{P}_{\text{base}}$ into a shadow VMEM slot and increments the per-page reference counters in $1.4\,\mu\text{s}$. When the speculative FastMCP payload arrives from the host NIC over PCIe/ICI, an asynchronous host-to-device DMA engine streams the pre-tokenized response tokens into a background chunked-prefill slot that populates the shadow KV page frames $\mathcal{P}_{\text{shadow}}$ without interrupting the MXU systolic arrays executing tokens $t \in [t_{\text{branch}}+1, t_{\text{eos}}]$. On an AST mismatch at $t_{\text{eos}}$, the scalar core restores the active page table pointer register to $\mathcal{P}_{\text{base}} \parallel \mathcal{P}_{\text{suffix}}$ and clears the shadow sync flags in $p_{50} = 3.8\,\mu\text{s}$ ($p_{99} = 9.4\,\mu\text{s}$).
-    \item \textbf{NVIDIA Blackwell B200 L2/TMEM Tensor Memory Accelerator Path:} On NVIDIA B200, $\mathcal{P}_{\text{SRAM}}$ is pinned in L2 persistence-locked SRAM and mirrored into Tensor Memory (TMEM) via a 128-byte aligned TMA descriptor (\texttt{CUtensorMap}). Creating the micro-checkpoint at $t_{\text{branch}}$ snapshots the TMA page-offset array in $1.7\,\mu\text{s}$. While the primary CUDA stream continues decoding tokens $t \in [t_{\text{branch}}+1, t_{\text{eos}}]$, a secondary low-priority CUDA stream receives the prefetched FastMCP response via GPUDirect RDMA / pinned host staging and populates $\mathcal{P}_{\text{shadow}}$. Upon an AST mismatch at $t_{\text{eos}}$, a single warp kernel restores the TMA page-offset array to $\mathcal{P}_{\text{base}} \parallel \mathcal{P}_{\text{suffix}}$ in $p_{50} = 4.4\,\mu\text{s}$ ($p_{99} = 10.1\,\mu\text{s}$).
+    \item \textbf{Cloud TPU v6e (Trillium) VMEM/CMEM DMA Descriptor Path:} On TPU v6e, the sequence block table $\mathcal{P}_{\text{SRAM}}$ resides in a dedicated $64\text{ KiB}$ region of Scalar/Vector Memory (VMEM). When Stage~1 triggers at $t_{\text{branch}}$, the VPU executes a single vectorized register move (\texttt{vmov.u32}) copying the active descriptor vector $\mathcal{P}_{\text{base}}$ into a shadow VMEM slot and increments the per-page reference counters in $1.4\,\mu\text{s}$. When the speculative FastMCP payload arrives from the host NIC over PCIe (or inter-node ICI in distributed multi-host TPU pods), an asynchronous host-to-device DMA engine streams the pre-tokenized response tokens into device memory, where shadow KV page frames $\mathcal{P}_{\text{shadow}}$ are chunk-prefilled using scheduled inter-token MXU bubbles or fused background slots without stalling the primary sequence's token generation iterations. On an AST mismatch at $t_{\text{eos}}$, the scalar core restores the active page table pointer register to $\mathcal{P}_{\text{base}} \parallel \mathcal{P}_{\text{suffix}}$ and clears the shadow sync flags in $p_{50} = 3.8\,\mu\text{s}$ ($p_{99} = 9.4\,\mu\text{s}$).
+    \item \textbf{NVIDIA Blackwell B200 L2/TMEM Tensor Memory Accelerator Path:} On NVIDIA B200, $\mathcal{P}_{\text{SRAM}}$ is pinned in L2 persistence-locked SRAM and addressed via a 128-byte aligned Tensor Memory Accelerator (TMA) descriptor table (\texttt{CUtensorMap}) that indexes into TMEM/L2 page descriptors. Creating the micro-checkpoint at $t_{\text{branch}}$ snapshots the TMA page-offset table in $1.7\,\mu\text{s}$. While the primary CUDA stream continues decoding tokens $t \in [t_{\text{branch}}+1, t_{\text{eos}}]$, a secondary low-priority CUDA stream receives the prefetched FastMCP response via GPUDirect RDMA / pinned host staging and populates $\mathcal{P}_{\text{shadow}}$ during inter-iteration compute gaps. Upon an AST mismatch at $t_{\text{eos}}$, a single warp kernel restores the TMA page-offset descriptor to $\mathcal{P}_{\text{base}} \parallel \mathcal{P}_{\text{suffix}}$ in $p_{50} = 4.4\,\mu\text{s}$ ($p_{99} = 10.1\,\mu\text{s}$).
 \end{enumerate}
 
 The total rollback latency $T_{\text{rb}}$ on either accelerator decomposes into three microarchitectural components:
@@ -532,7 +536,7 @@ To maximize the effective speculative hit rate without compromising exact semant
 Let $(\hat{w}, \hat{\mathbf{a}})$ and $(w^*, \mathbf{a}^*)$ be two well-typed FastMCP tool invocations over a deterministic read-only or MVCC snapshot-isolated database state $\Sigma_{\textnormal{db}}$. If their canonical AST digests match, i.e.,
 \begin{equation}
 \begin{aligned}
-h_{\textnormal{AST}}(\hat{w}, \hat{\mathbf{a}}) &= \operatorname{SHA-256}\!\left(\operatorname{CanonicalJSON}\!\left(\hat{w}, \Psi_{\textnormal{AST}}(\hat{\mathbf{a}})\right)\right) \\
+h_{\textnormal{AST}}(\hat{w}, \hat{\mathbf{a}}) &= \operatorname{SHA-256}\!\left(\operatorname{CanonicalJSON}\!\left(\operatorname{Lower}(\hat{w}), \Psi_{\textnormal{AST}}(\hat{\mathbf{a}}, \mathcal{S}_{\hat{w}}, \bot)\right)\right) \\
 &= h_{\textnormal{AST}}(w^*, \mathbf{a}^*),
 \end{aligned}
 \end{equation}
@@ -557,30 +561,33 @@ At token step $t_{\text{eos}}$:
 \begin{algorithmic}[1]
 \Require Autoregressive decoder $\mathcal{M}_\Theta$, registered tool catalog $\mathcal{W}$, conformal threshold $\tau_{\text{conf}} = 0.82$, entropy gate $H_{\max} = 0.72$, SRAM page table $\mathcal{P}_{\text{SRAM}}$.
 \Ensure Executed tool response spliced into KV-cache with minimal wall-clock latency.
-\State Initialize $t \leftarrow t_{\text{start}}$, $\text{spec\_active} \leftarrow \text{False}$, $\mathcal{D}_{\text{chk}} \leftarrow \text{None}$, $\mathcal{E}_{\text{wire}} \leftarrow \text{None}$
-\While{$y_t \neq \texttt{</tool\_call>}$}
+\State Initialize $t \leftarrow t_{\text{start}}$, $y_{t-1} \leftarrow \bot$, $\text{spec\_active} \leftarrow \text{False}$, $\mathcal{D}_{\text{chk}} \leftarrow \text{None}$, $\mathcal{E}_{\text{wire}} \leftarrow \text{None}$
+\While{$y_{t-1} \neq \texttt{</tool\_call>}$}
     \State Compute layer hidden states $\{\mathbf{h}_t^{(l)}\}_{l=1}^L$ and sample $y_t \sim \operatorname{Softmax}(\mathbf{W}_U \operatorname{RMSNorm}(\mathbf{h}_t^{(L)}))$
     \If{$\neg \text{spec\_active}$}
         \State Compute schema cross-attention entropy $H_{\text{attn}}^{(8:16)}(t)$ via Eqs.~\eqref{eq:schema_mass}--\eqref{eq:shannon_entropy}
-        \State Project logit-lens $\mathbf{z}_t^{(l)} = \mathbf{W}_U \operatorname{RMSNorm}(\mathbf{h}_t^{(l)})$ for $l \in \{8, 10, 12, 14, 16\}$
+        \State Project logit-lens $\mathbf{z}_t^{(l)} = \mathbf{W}_{U, \mathcal{V}_{\mathcal{W}}} \operatorname{RMSNorm}(\mathbf{h}_t^{(l)})$ for $l \in \{8, 10, 12, 14, 16\}$
         \State Extract $(\hat{w}, \hat{\mathbf{a}}, P_{\text{fused}}, C_{\text{arg}})$ and compute $C_{\text{conf}}(t) = 1 - s(x, (\hat{w}, \hat{\mathbf{a}}))$ via Eq.~\eqref{eq:nonconformity}
         \If{$H_{\text{attn}}^{(8:16)}(t) \le H_{\max}$ \textbf{and} $C_{\text{conf}}(t) \ge \tau_{\text{conf}}$ \textbf{and} $\mathcal{A}_{\text{req}}(\hat{w}) \subseteq \operatorname{dom}(\hat{\mathbf{a}})$}
             \If{$\kappa(\hat{w}) \in \{\texttt{READ\_ONLY}, \texttt{IDEMPOTENT\_DRY\_RUN}\}$ \textbf{and} $\neg\operatorname{HasMutatingDML}(\hat{\mathbf{a}})$}
                 \State $\mathcal{D}_{\text{chk}} \leftarrow \operatorname{CreateSRAMMicroCheckpoint}(\mathcal{P}_{\text{SRAM}}, t)$ \Comment{Stage 3 CoW pin}
-                \State $\mathcal{E}_{\text{wire}} \leftarrow \operatorname{AsyncDispatchFastMCP}(\hat{w}, \hat{\mathbf{a}}, \mathcal{D}_{\text{chk}}.h_{\text{chk}}, C_{\text{conf}}(t))$ \Comment{Stage 2}
+                \State $\mathcal{E}_{\text{wire}} \leftarrow \operatorname{AsyncDispatchFastMCP}(\hat{w}, \hat{\mathbf{a}}, \mathcal{D}_{\text{chk}}.h_{\text{chk}}, C_{\text{conf}}(t), T_{\text{lead}}, \kappa(\hat{w}))$ \Comment{Stage 2}
                 \State $\text{spec\_active} \leftarrow \text{True}$
             \EndIf
         \EndIf
+    \Else
+        \State $\operatorname{AppendTokenToSuffixPages}(\mathcal{D}_{\text{chk}}.\mathcal{P}_{\text{suffix}}, y_t)$
     \EndIf
     \State $t \leftarrow t + 1$
 \EndWhile
-\State Parse actual emitted tool call $(w^*, \mathbf{a}^*)$ at $t_{\text{eos}} = t$
+\State Parse actual emitted tool call $(w^*, \mathbf{a}^*)$ at $t_{\text{eos}} = t - 1$
 \If{$\text{spec\_active}$}
     \If{$h_{\text{AST}}(\hat{w}, \hat{\mathbf{a}}) = h_{\text{AST}}(w^*, \mathbf{a}^*)$}
         \State Await any residual I/O $\max(0, T_{\text{io}} - T_{\text{lead}})$ on $\mathcal{E}_{\text{wire}}$
         \State $\operatorname{SpliceShadowPagesIntoSRAM}(\mathcal{P}_{\text{SRAM}}, \mathcal{D}_{\text{chk}}, \mathcal{E}_{\text{wire}}.\text{payload})$ \Comment{$0\text{ ms}$ wait if $T_{\text{lead}} \ge T_{\text{io}}$}
     \Else
-        \State $\mathcal{P}_{\text{SRAM}} \leftarrow \mathcal{D}_{\text{chk}}.\mathcal{P}_{\text{base}} \parallel \mathcal{D}_{\text{chk}}.\mathcal{P}_{\text{suffix}}$ \Comment{$< 12\,\mu\text{s}$ O(1) CoW pointer rollback}
+        \State $\mathcal{P}_{\text{SRAM}} \leftarrow \mathcal{D}_{\text{chk}}.\mathcal{P}_{\text{base}} \parallel \mathcal{D}_{\text{chk}}.\mathcal{P}_{\text{suffix}}$ \Comment{$< 12\,\mu\text{s}$ ($4.2\,\mu\text{s}$ $p_{50}$) CoW pointer rollback}
+        \State $\operatorname{FreeShadowPages}(\mathcal{D}_{\text{chk}}.\mathcal{P}_{\text{shadow}})$
         \State Execute $(w^*, \mathbf{a}^*)$ synchronously and append to $\mathcal{P}_{\text{SRAM}}$
     \EndIf
 \Else
@@ -614,20 +621,20 @@ Let $T_{\textnormal{decode}} > 0$ denote the autoregressive token generation tim
     \item The expected latency reduction $\Delta \mathbb{E}[T] = \mathbb{E}[T_{\textnormal{serial}}] - \mathbb{E}[T_{\textnormal{synapse}}]$ is strictly positive:
     \begin{equation}
     \resizebox{0.84\columnwidth}{!}{$\displaystyle
-    \Delta \mathbb{E}[T] = p_{\textnormal{trig}} \Big( \eta\,\mathbb{E}\!\left[\min(T_{\textnormal{io}}, T_{\textnormal{lead}})\right] - \eta\,T_{\textnormal{splice}} - (1 - \eta)\,T_{\textnormal{rb}} \Big) > 0,
+    \Delta \mathbb{E}[T] = p_{\textnormal{trig}} \Big( \eta\,\mathbb{E}\!\left[\min(T_{\textnormal{io}}, T_{\textnormal{lead}}) \;\middle|\; \textnormal{Trig, Hit}\right] - \eta\,T_{\textnormal{splice}} - (1 - \eta)\,T_{\textnormal{rb}} \Big) > 0,
     $}
     \label{eq:expected_saving}
     \end{equation}
     whenever the canonical AST hit rate $\eta$ exceeds the critical break-even threshold:
     \begin{equation}
-    \eta > \eta^* = \frac{T_{\textnormal{rb}}}{\mathbb{E}\!\left[\min(T_{\textnormal{io}}, T_{\textnormal{lead}})\right] + T_{\textnormal{rb}} - T_{\textnormal{splice}}}.
+    \eta > \eta^* = \frac{T_{\textnormal{rb}}}{\mathbb{E}\!\left[\min(T_{\textnormal{io}}, T_{\textnormal{lead}}) \;\middle|\; \textnormal{Trig, Hit}\right] + T_{\textnormal{rb}} - T_{\textnormal{splice}}}.
     \label{eq:breakeven_eta}
     \end{equation}
 \end{enumerate}
 \end{theorem}
 
 \begin{proof}
-In the serial baseline, network dispatch begins strictly at $t_{\textnormal{eos}}$, so total wall-clock duration is $T_{\textnormal{serial}} = T_{\textnormal{decode}} + T_{\textnormal{io}}$. Under Agent-Synapse, when a speculative trigger fires at $t_{\text{branch}} = t_{\text{eos}} - T_{\text{lead}}/\tau_{\text{tok}}$, the network RPC executes in parallel with the remaining $T_{\textnormal{lead}}$ milliseconds of token decoding. If $h_{\textnormal{AST}}(\hat{w}, \hat{\mathbf{a}}) = h_{\textnormal{AST}}(w^*, \mathbf{a}^*)$, the response arrives at $t_{\textnormal{branch}} + T_{\textnormal{io}}$, leaving a post-EOS wait of $\max(0, T_{\textnormal{io}} - T_{\textnormal{lead}}) = T_{\textnormal{io}} - \min(T_{\textnormal{io}}, T_{\textnormal{lead}})$ plus $T_{\textnormal{splice}}$, which yields the first branch of Eq.~\eqref{eq:piecewise_latency}. If $h_{\textnormal{AST}}(\hat{w}, \hat{\mathbf{a}}) \neq h_{\textnormal{AST}}(w^*, \mathbf{a}^*)$, CoW pointer rollback executes at $t_{\textnormal{eos}}$ in $T_{\textnormal{rb}}$ followed by synchronous execution of $(w^*, \mathbf{a}^*)$ in $T_{\textnormal{io}}$, giving $T_{\textnormal{decode}} + T_{\textnormal{io}} + T_{\textnormal{rb}}$. Taking expectations over the three mutually exclusive events and subtracting from $\mathbb{E}[T_{\textnormal{serial}}]$ yields Eq.~\eqref{eq:expected_saving}. Setting $\Delta \mathbb{E}[T] > 0$ and solving for $\eta$ gives Eq.~\eqref{eq:breakeven_eta}. Substituting our empirical hardware parameters ($\mathbb{E}[\min(T_{\textnormal{io}}, T_{\textnormal{lead}})] \approx 224.0\text{ ms}$, $T_{\textnormal{rb}} \approx 0.0042\text{ ms}$, $T_{\textnormal{splice}} \approx 0.0021\text{ ms}$) yields $\eta^* \approx \frac{0.0042}{224.0021} \approx 1.87 \times 10^{-5}$ ($0.0019\%$), which our empirical hit rate $\eta = 89.4\%$ exceeds by more than four orders of magnitude.
+In the serial baseline, network dispatch begins strictly at $t_{\textnormal{eos}}$, so total wall-clock duration is $T_{\textnormal{serial}} = T_{\textnormal{decode}} + T_{\textnormal{io}}$. Under Agent-Synapse, when a speculative trigger fires at $t_{\text{branch}} = t_{\text{eos}} - T_{\text{lead}}/\tau_{\text{tok}}$, the network RPC executes in parallel with the remaining $T_{\textnormal{lead}}$ milliseconds of token decoding, and shadow KV pages are chunk-prefilled asynchronously in device memory prior to $t_{\text{eos}}$. If $h_{\textnormal{AST}}(\hat{w}, \hat{\mathbf{a}}) = h_{\textnormal{AST}}(w^*, \mathbf{a}^*)$, the response arrives at $t_{\textnormal{branch}} + T_{\textnormal{io}}$, leaving a post-EOS wait of $\max(0, T_{\textnormal{io}} - T_{\textnormal{lead}}) = T_{\textnormal{io}} - \min(T_{\textnormal{io}}, T_{\textnormal{lead}})$ plus $T_{\textnormal{splice}}$, which yields the first branch of Eq.~\eqref{eq:piecewise_latency}. If $h_{\textnormal{AST}}(\hat{w}, \hat{\mathbf{a}}) \neq h_{\textnormal{AST}}(w^*, \mathbf{a}^*)$, any in-flight RPC is cancelled via HTTP/2 \texttt{RST\_STREAM}, CoW pointer rollback executes at $t_{\textnormal{eos}}$ in $T_{\textnormal{rb}}$ followed by synchronous execution of $(w^*, \mathbf{a}^*)$ in $T_{\textnormal{io}}$, giving $T_{\textnormal{decode}} + T_{\textnormal{io}} + T_{\textnormal{rb}}$. Taking expectations conditioned on trigger and hit events and subtracting from $\mathbb{E}[T_{\textnormal{serial}}]$ yields Eq.~\eqref{eq:expected_saving}. Setting $\Delta \mathbb{E}[T] > 0$ and solving for $\eta$ gives Eq.~\eqref{eq:breakeven_eta}. Substituting our empirical hardware parameters ($\mathbb{E}[\min(T_{\textnormal{io}}, T_{\textnormal{lead}}) \mid \text{Trig, Hit}] \approx 224.0\text{ ms}$, $T_{\textnormal{rb}} \approx 0.0042\text{ ms}$, $T_{\textnormal{splice}} \approx 0.0021\text{ ms}$) yields $\eta^* \approx \frac{0.0042}{224.0021} \approx 1.87 \times 10^{-5}$ ($0.0019\%$), which our empirical hit rate $\eta = 89.4\%$ exceeds by more than four orders of magnitude.
 \end{proof}
 
 \subsection{Cascading Multi-Step Agentic Turn Horizon}
@@ -635,17 +642,17 @@ Enterprise agent sessions rarely consist of a single isolated tool call; instead
 
 \begin{corollary}[Cumulative Multi-Turn Latency Compression Across $J$-Step Agent Trajectories]
 \label{cor:multiturn}
-Consider a $J$-step sequential agent trajectory in which $J_{\textnormal{idem}} = \rho_{\textnormal{idem}} J$ turns invoke idempotent read or dry-run tools ($\kappa(w^{(j)}) \in \{\texttt{READ\_ONLY}, \texttt{IDEMPOTENT\_DRY\_RUN}\}$) and $(1 - \rho_{\textnormal{idem}}) J$ turns invoke mutating tools gated to post-EOS execution. Under independent per-turn speculative trigger rate $p_{\textnormal{trig}}$ and conditional AST hit rate $\eta$, the expected cumulative trajectory latency $\mathbb{E}[T_{\textnormal{traj}}^{(J)}]$ satisfies:
+Consider a $J$-step sequential agent trajectory in which $J_{\textnormal{idem}} = \rho_{\textnormal{idem}} J$ turns invoke idempotent read or dry-run tools ($\kappa(w^{(j)}) \in \{\texttt{READ\_ONLY}, \texttt{IDEMPOTENT\_DRY\_RUN}\}$) and $(1 - \rho_{\textnormal{idem}}) J$ turns invoke mutating tools gated to post-EOS execution. Assuming turn-wise independence of speculative triggers, the expected cumulative trajectory latency $\mathbb{E}[T_{\textnormal{traj}}^{(J)}]$ satisfies:
 \begin{equation}
 \resizebox{0.88\columnwidth}{!}{$\displaystyle
 \begin{aligned}
 \mathbb{E}\!\left[T_{\textnormal{traj}}^{(J)}\right] &= \sum_{j=1}^J \mathbb{E}\!\left[T_{\textnormal{decode}}^{(j)} + T_{\textnormal{io}}^{(j)}\right] \\
-&\quad - \rho_{\textnormal{idem}} J p_{\textnormal{trig}} \Big(\eta\,\mathbb{E}\!\left[\min(T_{\textnormal{io}}, T_{\textnormal{lead}})\right] - \eta T_{\textnormal{splice}} - (1 - \eta) T_{\textnormal{rb}}\Big),
+&\quad - \rho_{\textnormal{idem}} J p_{\textnormal{trig}} \Big(\eta\,\mathbb{E}\!\left[\min(T_{\textnormal{io}}, T_{\textnormal{lead}}) \;\middle|\; \textnormal{Trig, Hit}\right] - \eta T_{\textnormal{splice}} - (1 - \eta) T_{\textnormal{rb}}\Big),
 \end{aligned}
 $}
 \label{eq:multiturn_saving}
 \end{equation}
-and the variance of the cumulative speculative overhead on mismatched turns is bounded by $\operatorname{Var}(\sum_{j} \mathbb{I}_{\textnormal{mismatch}}^{(j)} T_{\textnormal{rb}}) \le \rho_{\textnormal{idem}} J p_{\textnormal{trig}}(1-\eta) T_{\textnormal{rb}}^2 < 2.1 \times 10^{-5}\text{ ms}^2$ at median $T_{\textnormal{rb}} = 4.2\,\mu\text{s}$ ($< 1.7 \times 10^{-4}\text{ ms}^2$ at worst-case $T_{\textnormal{rb}} = 12\,\mu\text{s}$) for $J \le 12$.
+and the variance of the cumulative speculative rollback overhead across turns is bounded by $\operatorname{Var}(\sum_{j} \mathbb{I}_{\textnormal{mismatch}}^{(j)} T_{\textnormal{rb}}^{(j)}) \le \rho_{\textnormal{idem}} J p_{\textnormal{trig}}(1-\eta) \mathbb{E}[(T_{\textnormal{rb}})^2] < 1.7 \times 10^{-4}\text{ ms}^2$ for $T_{\textnormal{rb}}^{\max} = 12\,\mu\text{s}$ and $J \le 12$.
 \end{corollary}
 
 \begin{proof}
@@ -658,7 +665,7 @@ A natural systems question is whether speculative prefetching overloads downstre
 \Lambda_{\text{load}}(\tau_{\text{conf}}) = 1 + p_{\text{trig}}(\tau_{\text{conf}}) \cdot \left(1 - \eta(\tau_{\text{conf}})\right).
 \label{eq:load_multiplier}
 \end{equation}
-At our operating threshold $\tau_{\text{conf}} = 0.82$ ($p_{\text{trig}} = 0.904$, i.e., $678/750$ triggered idempotent turns, with conditional hit rate $\eta = 89.4\%$ [$606/678$ triggered hits; $671/750$ total AST-equivalent turns including $65/72$ non-triggered post-EOS matches]), the net database query overhead is only $\Lambda_{\text{load}}(0.82) - 1 = 0.904 \times 0.106 = 9.58\%$ ($72$ extra queries across $750$ turns). Furthermore, when downstream database CPU utilization $u_{\text{db}} \in [0, 1]$ approaches a cluster congestion watermark $u_{\text{high}}$ (e.g., $u_{\text{high}} = 0.80$), the database proxy dynamically raises the minimum accepted conformal score threshold via the header \texttt{X-Synapse-Conformal-Score}:
+At our operating threshold $\tau_{\text{conf}} = 0.82$ ($p_{\text{trig}} = 0.904$, i.e., $678/750$ triggered idempotent turns, with conditional hit rate $\eta = 89.4\%$ [$606/678$ triggered hits; $671/750$ total AST-equivalent turns including $65/72$ non-triggered post-EOS matches]), the net database query overhead is $\Lambda_{\text{load}}(0.82) - 1 = 72/750 = 9.60\%$ ($72$ extra queries across $750$ turns; $0.904 \times (1 - 0.8938) = 9.60\%$). Furthermore, when downstream database CPU utilization $u_{\text{db}} \in [0, 1]$ approaches a cluster congestion watermark $u_{\text{high}}$ (e.g., $u_{\text{high}} = 0.80$), the database proxy dynamically raises the minimum accepted conformal score threshold via the header \texttt{X-Synapse-Conformal-Score}:
 \begin{equation}
 \tau_{\text{adm}}(u_{\text{db}}) = \tau_{\text{conf}} + (1 - \tau_{\text{conf}}) \cdot \max\!\left(0,\, \frac{u_{\text{db}} - u_{\text{high}}}{1 - u_{\text{high}}}\right),
 \label{eq:qos_admission}
@@ -687,8 +694,8 @@ Mean Pre-EOS Prediction Lead Time ($T_{\text{lead}}$) & $0.0\text{ ms}$ (Post-EO
 Conditional Speculative AST Hit Rate ($\eta$) & N/A ($0.0\%$ Prefetch) & $68.2\%$ (Raw String Match) & $\mathbf{89.4\%}$ ($606/678$ Trig.; $671/750$ All) & $+21.2\text{ pp}$ via AST + Conformal \\
 Speculative Mismatch Rate ($1 - \eta$) & N/A & $31.8\%$ & $\mathbf{10.6\%}$ ($72/678$ Triggered) & Bounded by Theorem~\ref{thm:conformal} \\
 Mismatch Recovery Latency ($p_{50} / p_{99}$) & N/A & $28{,}400\,\mu\text{s} / 44{,}100\,\mu\text{s}$ (HBM Re-Prefill) & $\mathbf{4.2\,\mu\text{\textbf{s}} / 9.8\,\mu\text{\textbf{s}}}$ (SRAM CoW) & $\mathbf{< 12.0\,\mu\text{\textbf{s}}}$ SLA ($3{,}800\times$ faster) \\
-Cloud TPU v6e VMEM CoW Swap ($p_{50} / p_{99}$) & N/A & $26{,}900\,\mu\text{s} / 41{,}800\,\mu\text{s}$ & $\mathbf{3.8\,\mu\text{\textbf{s}} / 9.4\,\mu\text{\textbf{s}}}$ & $16$-token page descriptor restore \\
-NVIDIA B200 TMEM CoW Swap ($p_{50} / p_{99}$) & N/A & $29{,}800\,\mu\text{s} / 45{,}200\,\mu\text{s}$ & $\mathbf{4.4\,\mu\text{\textbf{s}} / 10.1\,\mu\text{\textbf{s}}}$ & $16$-token page descriptor restore \\
+Rollback Latency (Cloud TPU v6e) & N/A & $26{,}900\,\mu\text{s} / 41{,}800\,\mu\text{s}$ & $\mathbf{3.8\,\mu\text{\textbf{s}} / 9.4\,\mu\text{\textbf{s}}}$ & $16$-token page descriptor restore \\
+Rollback Latency (NVIDIA B200) & N/A & $29{,}800\,\mu\text{s} / 45{,}200\,\mu\text{s}$ & $\mathbf{4.4\,\mu\text{\textbf{s}} / 10.1\,\mu\text{\textbf{s}}}$ & $16$-token page descriptor restore \\
 \midrule
 \multicolumn{5}{@{}l}{\textit{\textbf{Panel C: Observational Non-Interference \& Transactional Mutation Safety ($N = 250$ Mutating/DML Probes)}}} \\
 Unauthorized Speculative Write/Delete Calls & $0 / 250$ ($0.00\%$) & $74 / 250$ ($29.60\%$ Corrupted) & $\mathbf{0 / 250}$ ($\mathbf{0.00\%}$) & Theorem~\ref{thm:noninterference} (100\% Blocked) \\
@@ -764,7 +771,7 @@ In contrast, Agent-Synapse triggers speculative FastMCP prefetching on $678 / 75
 \centering
 \footnotesize
 \renewcommand{\arraystretch}{1.08}
-\caption{Per-Workload Latency, Prediction Lead Time, Canonical AST Hit Rate, and Safety Breakdown Across All Six Enterprise Tool Families ($N = 1{,}000$ Traces)}
+\caption{Per-Workload Latency, Prediction Lead Time, Canonical AST Hit Rate, and Safety Breakdown Across All Six Enterprise Tool Families ($N = 1{,}000$ Traces; Idempotent Metrics Conditioned on Triggered Turns)}
 \label{tab:per_workload}
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{@{}llcccccc@{}}
@@ -782,6 +789,8 @@ DML-in-Read Injection Probes & Blocked by $\operatorname{HasMutatingDML}$ & $50$
 \bottomrule
 \end{tabular}%
 }
+\vspace*{1mm}
+{\scriptsize Note: Across the four idempotent families ($N = 750$ total traces), Agent-Synapse triggers speculative prefetching on $678$ turns ($n_{\text{trig}} = 181$ for Spanner GQL, $178$ for BigQuery, $183$ for Vertex AI, and $136$ for ERP Dry-Run). Reported $T_{\text{lead}}$ and $\eta$ are conditioned on triggered turns ($606/678 = 89.4\%$). Ungated AST match across all $750$ traces is $671/750 = 89.47\%$.}
 \end{table*}
 
 Examining the per-workload breakdown in Table~\ref{tab:per_workload} reveals two notable properties:
@@ -835,8 +844,8 @@ Examining the per-workload breakdown in Table~\ref{tab:per_workload} reveals two
 \subsection{Layer-Depth Sensitivity and Split-Conformal Pareto Frontier}
 Table~\ref{tab:layer_depth} evaluates how the choice of monitored transformer layers $\mathcal{L}_{\text{early}}$ impacts prediction lead time $T_{\text{lead}}$, canonical AST hit rate $\eta$, and per-step compute overhead:
 \begin{itemize}
-    \item Monitoring only shallow layers ($l \in [4, 8]$) yields a slightly longer lead time ($291.2\text{ ms}$) but suffers from premature semantic instability ($\eta = 76.4\%$), as entity literal bindings in complex SQL/GQL predicates are not yet fully resolved at Layer $6$.
-    \item Monitoring late layers ($l \in [20, 28]$) increases precision to $91.8\%$ but sacrifices $68.4\text{ ms}$ of lead time ($T_{\text{lead}} = 202.2\text{ ms}$) because the representations only cross the confidence threshold much later in the decode window.
+    \item Monitoring only shallow layers ($l \in \{4, 6, 8\}$) yields a slightly longer lead time ($291.2\text{ ms}$) but suffers from premature semantic instability ($\eta = 76.4\%$), as entity literal bindings in complex SQL/GQL predicates are not yet fully resolved at Layer $6$.
+    \item Monitoring late layers ($l \in \{20, 24, 28\}$) increases precision to $91.8\%$ but sacrifices $68.4\text{ ms}$ of lead time ($T_{\text{lead}} = 202.2\text{ ms}$) because the representations only cross the confidence threshold much later in the decode window.
     \item Our depth-weighted band $l \in \{8, 10, 12, 14, 16\}$ captures the exact phase transition where schema cross-attention entropy collapses ($H_{\text{attn}}^{(8:16)} \le 0.72$), achieving $\eta = 89.4\%$ and $T_{\text{lead}} = 270.6\text{ ms}$ with only $0.14\text{ ms}$ of VPU/Tensor Core projection overhead per step.
 \end{itemize}
 
@@ -854,10 +863,12 @@ Table~\ref{tab:layer_depth} evaluates how the choice of monitored transformer la
 Shallow ($l \in \{4, 6, 8\}$) & $291.2\text{ ms}$ & $76.4\%$ & $0.11\text{ ms}$ & $378.4\text{ ms}$ \\
 \textbf{Intermediate ($l \in \{8..16\}$)} & $\mathbf{270.6\text{ \textbf{ms}}}$ & $\mathbf{89.4\%}$ & $\mathbf{0.14\text{ \textbf{ms}}}$ & $\mathbf{321.6\text{ \textbf{ms}}}$ \\
 Deep ($l \in \{20, 24, 28\}$) & $202.2\text{ ms}$ & $91.8\%$ & $0.14\text{ ms}$ & $369.5\text{ ms}$ \\
-Dense 32-Layer ($l \in [1, 32]$) & $272.0\text{ ms}$ & $89.7\%$ & $0.89\text{ ms}$ & $341.2\text{ ms}$ \\
+Dense 32-Layer ($l \in [1, 32]$)$^\dagger$ & $272.0\text{ ms}$ & $89.7\%$ & $0.89\text{ ms}$ & $341.2\text{ ms}$ \\
 \bottomrule
 \end{tabular}%
 }
+\vspace*{1mm}
+{\scriptsize $^\dagger$The Dense 32-layer variant evaluates a 32-layer dense Multi-Head Attention (MHA) backbone architecture to benchmark all-layer projection overhead, whereas rows 1--3 evaluate the default 64-layer 70B GQA backbone under sparse layer monitoring.}
 \end{table}
 
 Figure~\ref{fig:conformal_pareto} and Table~\ref{tab:ablation} further analyze the Pareto trade-off governed by the split-conformal confidence threshold $\tau_{\text{conf}} \in [0.55, 0.95]$:
@@ -883,16 +894,18 @@ Furthermore, Table~\ref{tab:ablation} isolates the contribution of Stage~3's can
 \textbf{Full Agent-Synapse (Ours)} & $\mathbf{89.4\%}$ & $\mathbf{321.6\text{ \textbf{ms}}}$ & $\mathbf{9.8\,\mu\text{\textbf{s}}}$ & $\mathbf{0.00\%}$ \\
 $-$ Canonical AST (Raw String Match) & $74.8\%$ & $389.4\text{ ms}$ & $9.8\,\mu\text{s}$ & $0.00\%$ \\
 $-$ Attention Entropy Gate ($H_{\text{attn}}$) & $81.2\%$ & $364.2\text{ ms}$ & $9.9\,\mu\text{s}$ & $0.00\%$ \\
-$-$ Split-Conformal Gate ($\tau_{\text{conf}}$) & $68.2\%$ & $418.5\text{ ms}$ & $10.1\,\mu\text{s}$ & $0.00\%$ \\
+$-$ Split-Conformal Gate ($\tau_{\text{conf}}$)$^\ddagger$ & $68.2\%$ & $418.5\text{ ms}$ & $10.1\,\mu\text{s}$ & $0.00\%$ \\
 $-$ Stage 2 Idempotency Safety Gate & $89.4\%$ & $321.6\text{ ms}$ & $9.8\,\mu\text{s}$ & $29.60\%$ ($74/250$) \\
 $-$ Stage 3 SRAM CoW (HBM Re-Prefill) & $89.4\%$ & $366.8\text{ ms}$ & $44{,}100\,\mu\text{s}$ & $0.00\%$ \\
 \bottomrule
 \end{tabular}%
 }
+\vspace*{1mm}
+{\scriptsize $^\ddagger$Each row represents a single-factor component removal relative to full Agent-Synapse. The row `$-$ Split-Conformal Gate ($\tau_{\text{conf}}$)' evaluates ungated speculation across all traces; its reported AST hit rate reflects raw string match ($68.2\%$) under unconditional dispatch, whereas with canonical AST retained, the ungated canonical hit rate is $89.47\%$ ($671/750$).}
 \end{table}
 
 \subsection{Microsecond SRAM Copy-on-Write Rollback vs.\ HBM Re-Prefill}
-Table~\ref{tab:main_benchmark} (Panel~B) and Table~\ref{tab:ablation} compare Stage~3's on-chip SRAM Copy-on-Write page-table rollback against standard HBM KV-cache eviction and re-prefill across the $72$ triggered speculative mismatches ($10.6\%$ of $678$ triggered turns; $79$ mismatches when all $750$ turns are forced to speculate without conformal gating). When an unpinned speculative payload must be evicted from HBM and the context re-prefilled, standard serving engines incur $28.4\text{ ms}$ at $p_{50}$ and $44.1\text{ ms}$ at $p_{99}$. By instead pinning the pre-branch page-table descriptor $\mathcal{P}_{\text{base}}$ in on-chip SRAM (Cloud TPU v6e VMEM/CMEM or NVIDIA B200 TMEM) and writing speculative response tokens exclusively to shadow pages $\mathcal{P}_{\text{shadow}}$, Agent-Synapse restores $\mathcal{P}_{\text{SRAM}} \leftarrow \mathcal{P}_{\text{base}} \parallel \mathcal{P}_{\text{suffix}}$ in \textbf{$4.2\,\mu\text{s}$ at $p_{50}$ and $9.8\,\mu\text{s}$ at $p_{99}$} ($3.8\,\mu\text{s}$ $p_{50}$ on Cloud TPU v6e and $4.4\,\mu\text{s}$ $p_{50}$ on NVIDIA B200), strictly satisfying the $< 12.0\,\mu\text{s}$ hardware SLA and achieving a \textbf{$3{,}800\times$ rollback speedup}.
+Table~\ref{tab:main_benchmark} (Panel~B), Table~\ref{tab:ablation}, and Table~\ref{tab:rollback_breakdown} (Appendix~\ref{app:sram_model}) compare Stage~3's on-chip SRAM Copy-on-Write page-table rollback against standard HBM KV-cache eviction and re-prefill across the $72$ triggered speculative mismatches ($10.6\%$ of $678$ triggered turns; $79$ mismatches when all $750$ turns are forced to speculate without conformal gating). When an unpinned speculative payload must be evicted from HBM and the context re-prefilled, standard serving engines incur $28.4\text{ ms}$ at $p_{50}$ and $44.1\text{ ms}$ at $p_{99}$. By instead pinning the pre-branch page-table descriptor $\mathcal{P}_{\text{base}}$ in on-chip SRAM (Cloud TPU v6e VMEM/CMEM or NVIDIA B200 TMEM) and writing speculative response tokens exclusively to shadow pages $\mathcal{P}_{\text{shadow}}$, Agent-Synapse restores $\mathcal{P}_{\text{SRAM}} \leftarrow \mathcal{P}_{\text{base}} \parallel \mathcal{P}_{\text{suffix}}$ in \textbf{$4.2\,\mu\text{s}$ at $p_{50}$ and $9.8\,\mu\text{s}$ at $p_{99}$} ($3.8\,\mu\text{s}$ $p_{50}$ on Cloud TPU v6e and $4.4\,\mu\text{s}$ $p_{50}$ on NVIDIA B200), strictly satisfying the $< 12.0\,\mu\text{s}$ hardware SLA and achieving a \textbf{$3{,}800\times$ rollback speedup}.
 
 \subsection{Detailed Canonical AST Normalization Algorithm and Grammar Rules}
 Algorithm~\ref{alg:ast_canon} formalizes the exact recursive canonicalization operator $\Psi_{\text{AST}}$ and constant-time SHA-256 splicing check executed by Stage~3 at step $t_{\text{eos}}$. Unlike heuristic fuzzy matching---which risks splicing a prefetched database response when a filter literal has actually changed (e.g., \texttt{risk\_score > 0.85} vs.\ \texttt{risk\_score > 0.95})---$\Psi_{\text{AST}}$ applies strictly semantics-preserving algebraic equivalence transformations over JSON AST nodes and relational/graph query clauses:
@@ -923,9 +936,9 @@ Algorithm~\ref{alg:ast_canon} formalizes the exact recursive canonicalization op
     \ElsIf{$\text{node}$ is $\text{String}$ \textbf{and} $k_{\text{ctx}} \in \mathcal{K}_{\text{query\_args}}$}
         \State $s \leftarrow \operatorname{CollapseWhitespaceAndFoldKeywords}(\text{node})$
         \If{$\operatorname{HasConjunctiveWhereClause}(s)$ \textbf{and} $\neg\operatorname{HasTopLevelOr}(s)$}
-            \State $(\text{prefix}, \{P_1, \dots, P_r\}, \text{suffix}) \leftarrow \operatorname{SplitWhereConjuncts}(s)$
-            \State $\{P_{\pi(1)}, \dots, P_{\pi(r)}\} \leftarrow \operatorname{SortLexicographical}(\{P_1, \dots, P_r\})$
-            \State $s \leftarrow \text{prefix} \parallel \texttt{" WHERE "} \parallel \operatorname{Join}(\texttt{" AND "}, \{P_{\pi(1)}, \dots, P_{\pi(r)}\}) \parallel \text{suffix}$
+            \State $(\text{prefix}, [P_1, \dots, P_r], \text{suffix}) \leftarrow \operatorname{SplitWhereConjuncts}(s)$
+            \State $[P_{\pi(1)}, \dots, P_{\pi(r)}] \leftarrow \operatorname{SortLexicographical}([P_1, \dots, P_r])$
+            \State $s \leftarrow \text{prefix} \parallel \texttt{" WHERE "} \parallel \operatorname{Join}(\texttt{" AND "}, [P_{\pi(1)}, \dots, P_{\pi(r)}]) \parallel \text{suffix}$
         \EndIf
         \State \Return $s$
     \EndIf
@@ -983,7 +996,7 @@ In anti-money-laundering (AML) compliance workflows, an agent queries a multi-bi
 \scriptsize\ttfamily
 GRAPH EnterpriseFinancialKG MATCH (src:Account \{jurisdiction: 'CH'\})-[w1:WIRE]-> (mid:ShellEntity)-[w2:WIRE]->(dst:Account) WHERE w1.amount\_usd >= 100000 AND w2.timestamp >= TIMESTAMP('2026-01-01T00:00:00Z') RETURN src.account\_id, mid.entity\_id, dst.account\_id, w1.amount\_usd ORDER BY w1.amount\_usd DESC LIMIT 25
 \end{quote}
-During autoregressive decoding, once the model emits the anchor tokens \texttt{spanner\_graph\_query\_gql}, the graph identifier \texttt{EnterpriseFinancialKG}, and the core pattern bindings \texttt{jurisdiction: 'CH'} and \texttt{amount\_usd >= 100000} at token step $t_{\text{branch}} = 24$, the intermediate logit lens at Layers $12$--$16$ already projects the remaining $28$ tokens (\texttt{RETURN ... ORDER BY ... LIMIT 25"\}\}</tool\_call>}) with conformal confidence $C_{\text{conf}} = 0.91 > \tau_{\text{conf}} = 0.82$. Stage~2 immediately dispatches the ISO GQL query over gRPC/HTTP2 with \texttt{X-Agent-Speculative-Prefetch: True}. Cloud Spanner's Paxos leaderless read-only snapshot replica~\cite{corbett2012spanner} executes the distributed index join across $279.4\text{ ms}$ of overlap window while the TPU v6e finishes decoding the closing syntax. At \texttt{</tool\_call>} EOS, even if the model swapped the order of the two \texttt{WHERE} conjuncts (\texttt{w2.timestamp >= ... AND w1.amount\_usd >= ...}), Stage~3's canonical AST normalizer $\Psi_{\text{AST}}$ maps both to the identical SHA-256 digest and splices the returned subgraph into VMEM in $2.1\,\mu\text{s}$, cutting $p_{99}$ turn latency from $846.0\text{ ms}$ to $318.5\text{ ms}$ ($-62.4\%$).
+During autoregressive decoding, once the model emits the anchor tokens \texttt{spanner\_graph\_query\_gql}, the graph identifier \texttt{EnterpriseFinancialKG}, and the core pattern bindings \texttt{jurisdiction: 'CH'} and \texttt{amount\_usd >= 100000} at token step $t_{\text{branch}} = 24$, early-layer representations across Layers $12$--$16$ commit to the required tool call structure and argument bindings with conformal confidence $C_{\text{conf}} = 0.91 > \tau_{\text{conf}} = 0.82$, while the remaining $28$ tokens of closing syntax and return projections (\texttt{RETURN ... ORDER BY ... LIMIT 25"\}\}</tool\_call>}) continue to decode in parallel with external I/O. Stage~2 immediately dispatches the ISO GQL query over gRPC/HTTP2 with \texttt{X-Agent-Speculative-Prefetch: True}. Cloud Spanner's Paxos leaderless read-only snapshot replica~\cite{corbett2012spanner} executes the distributed index join across $279.4\text{ ms}$ of overlap window while the TPU v6e finishes decoding the closing syntax. At \texttt{</tool\_call>} EOS, even if the model swapped the order of the two \texttt{WHERE} conjuncts (\texttt{w2.timestamp >= ... AND w1.amount\_usd >= ...}), Stage~3's canonical AST normalizer $\Psi_{\text{AST}}$ maps both to the identical SHA-256 digest and splices the returned subgraph into VMEM in $2.1\,\mu\text{s}$, cutting $p_{99}$ turn latency from $846.0\text{ ms}$ to $318.5\text{ ms}$ ($-62.4\%$).
 
 \subsubsection{Case Study 2: Petabyte Telemetry Aggregation on BigQuery Dremel SQL}
 In FinOps and cloud reliability diagnostics, agents invoke \texttt{bigquery\_execute\_analytics} to run columnar aggregations over partitioned BigQuery tables~\cite{melnik2010dremel}. Because Dremel's root mixer must allocate shuffle slots and broadcast column metadata to leaf workers ($80\text{ ms}$--$140\text{ ms}$ of coordination setup before scan completion), initiating the query $284.1\text{ ms}$ prior to \texttt{</tool\_call>} EOS hides $100\%$ of the Dremel mixer scheduling latency behind token generation, reducing $p_{99}$ turn latency from $872.0\text{ ms}$ to $338.2\text{ ms}$ ($-61.2\%$).
@@ -997,9 +1010,9 @@ When preparing a multi-currency journal entry in SAP S/4HANA (\texttt{erp\_post\
 \subsection{Security and Threat Analysis: Defending Against Speculative Side-Channel and Prompt Injection Attacks}
 Because speculative execution in hardware processors historically introduced microarchitectural side channels, we explicitly analyze the security properties of Agent-Synapse against three threat vectors:
 \begin{enumerate}
-    \item \textbf{Indirect Prompt Injection Attempting Speculative Data Exfiltration or Destruction~\cite{debenedetti2025camel}:} Suppose a malicious document retrieved in Turn $j-1$ attempts to hijack the model in Turn $j$ into calling \texttt{crm\_delete\_customer\_record} or injecting \texttt{; DROP TABLE customers;--} into \texttt{bigquery\_execute\_analytics}. Even if early transformer layers $l \in [8, 16]$ transiently attend to the injected instruction before upper safety-aligned layers ($l \in [24, L]$) refuse the request, Stage~2's deterministic idempotency gate ($\kappa = \texttt{MUTATING\_BLOCKED}$) and lexical/AST guard ($\operatorname{HasMutatingDML}$) unconditionally block the speculative wire dispatch ($0/250$ unsafe dispatches in Table~\ref{tab:main_benchmark}).
+    \item \textbf{Indirect Prompt Injection Attempting Speculative Data Exfiltration or Destruction~\cite{debenedetti2025camel}:} Suppose a malicious document retrieved in Turn $j-1$ attempts to hijack the model in Turn $j$ into calling \texttt{crm\_delete\_customer\_record} or injecting \texttt{; DROP TABLE customers;--} into \texttt{bigquery\_execute\_analytics}. Even if early transformer layers $l \in [8, 16]$ transiently attend to the injected instruction before upper safety-aligned layers ($l \in [24, L]$) refuse the request, Stage~2's deterministic idempotency gate ($\kappa = \texttt{MUTATING\_BLOCKED}$) and lexical/AST guard ($\operatorname{HasMutatingDML}$) unconditionally block the speculative wire dispatch ($0/250$ unsafe dispatches in Table~\ref{tab:main_benchmark}). We note that while Stage~2 guarantees zero speculative state mutations, defense against speculative read-only exfiltration relies on downstream database RBAC/ABAC security contexts, and lexical DML filtering is complemented by parameterized SQL/GQL prepared statements.
     \item \textbf{Cross-Tenant Speculative Cache Poisoning:} Because every speculative FastMCP request is bound to a sequence-specific SHA-256 checkpoint hash \texttt{X-Synapse-Checkpoint-Hash: }$h_{\text{chk}} = \operatorname{SHA-256}(\text{accel} \parallel t_{\text{branch}} \parallel \mathcal{P}_{\text{base}})$ and shadow pages $\mathcal{P}_{\text{shadow}}$ are mapped exclusively into the owning sequence's private SRAM page descriptor after canonical AST verification, a prefetched payload from tenant $A$ can never be spliced into tenant $B$'s KV-cache.
-    \item \textbf{Speculative Denial-of-Service (DoS) Amplification:} Each agent turn is restricted by Algorithm~\ref{alg:synapse} (Line~4, $\neg\text{spec\_active}$) to at most \emph{one} speculative prefetch per turn, gated by $\tau_{\text{conf}} = 0.82$ and throttled under cluster load via Eq.~\eqref{eq:qos_admission}, bounding worst-case backend query amplification to $\le 9.58\%$.
+    \item \textbf{Speculative Denial-of-Service (DoS) Amplification:} Each agent turn is restricted by Algorithm~\ref{alg:synapse} (Line~4, $\neg\text{spec\_active}$) to at most \emph{one} speculative prefetch per turn, gated by $\tau_{\text{conf}} = 0.82$ and throttled under cluster load via Eq.~\eqref{eq:qos_admission}, bounding worst-case backend query amplification to $\le 9.60\%$ ($72/750$ extra queries).
 \end{enumerate}
 
 \section{Production Deployment and Architectural Discussion}
@@ -1015,7 +1028,7 @@ Agent-Synapse is designed as a drop-in runtime extension for enterprise foundati
 \section{Related Work}
 \label{sec:related}
 
-\textbf{Speculative Decoding and Tool Calling for LLMs:} Leviathan et al.~\cite{leviathan2023fast} and Chen et al.~\cite{chen2023accelerating} introduced draft-target speculative decoding to accelerate autoregressive token generation without altering the output distribution. Medusa~\cite{cai2024medusa} and EAGLE~\cite{li2024eagle} eliminated the separate draft model by attaching lightweight prediction heads to top transformer layers, while recent tool-calling frameworks such as LLMCompiler~\cite{kim2024llmcompiler} and speculative tool-calling systems~\cite{zhang2025spectool} explore parallel or draft-model-assisted function invocation across separate LLM calls. However, existing token-level speculative decoding and draft-agent methods operate at the post-EOS vocabulary or multi-agent planner boundary, waiting for full tool-call emission before dispatching network RPCs or lacking on-chip SRAM KV-cache rollback. Agent-Synapse is the first system to project intermediate hidden states across the hardware NIC boundary \emph{mid-decode} while binding speculative FastMCP wire headers directly to Cloud TPU v6e~\cite{google2024trillium} and NVIDIA B200~\cite{nvidia2024blackwell} on-chip SRAM page tables.
+\textbf{Speculative Decoding and Tool Calling for LLMs:} Leviathan et al.~\cite{leviathan2023fast} and Chen et al.~\cite{chen2023accelerating} introduced draft-target speculative decoding to accelerate autoregressive token generation without altering the output distribution. Medusa~\cite{cai2024medusa} and EAGLE~\cite{li2024eagle} eliminated the separate draft model by attaching lightweight prediction heads to top transformer layers, while recent tool-calling frameworks such as LLMCompiler~\cite{kim2024llmcompiler} and Speculative Actions~\cite{ye2025speculative} explore parallel or draft-model-assisted function invocation across separate LLM calls. However, existing token-level speculative decoding and draft-agent methods operate at the post-EOS vocabulary or multi-agent planner boundary, waiting for full tool-call emission before dispatching network RPCs or lacking on-chip SRAM KV-cache rollback. Agent-Synapse is the first system to project intermediate hidden states across the hardware NIC boundary \emph{mid-decode} while binding speculative FastMCP wire headers directly to Cloud TPU v6e~\cite{google2024trillium} and NVIDIA B200~\cite{nvidia2024blackwell} on-chip SRAM page tables.
 
 \textbf{Early-Exit Transformers and Mechanistic Interpretability:} The Logit Lens~\cite{nostalgebraist2020logitlens} and Tuned Lens~\cite{belrose2023eliciting} demonstrated that intermediate transformer representations encode high-probability predictions of future tokens well before the final layer. CALM~\cite{schuster2022confident} leveraged early-exit classifiers to skip upper transformer layers on easy tokens, while Angelopoulos and Bates~\cite{angelopoulos2023conformal} and Shafer and Vovk~\cite{shafer2008tutorial} established distribution-free split-conformal risk bounds. Agent-Synapse repurposes early-layer logit-lens projections and cross-attention entropy not to truncate layer computation (which would degrade reasoning quality on complex prompts), but to launch asynchronous, side-effect-free network prefetches while full-depth decoding continues unimpeded.
 
@@ -1046,7 +1059,7 @@ Q_{1-\delta}\!\left(T_{\textnormal{synapse}} \mid \textnormal{Hit}\right) &\le Q
 \end{proposition}
 
 \begin{proof}
-On the speculative hit event, Eq.~\eqref{eq:piecewise_latency} gives $T_{\textnormal{synapse}} = T_{\textnormal{decode}} + T_{\textnormal{io}} - \min(T_{\textnormal{io}}, T_{\textnormal{lead}}) + T_{\textnormal{splice}} = T_{\textnormal{serial}} - \min(T_{\textnormal{io}}, T_{\textnormal{lead}}) + T_{\textnormal{splice}}$. Because $T_{\textnormal{lead}} \ge T_{\textnormal{lead}}^{\min} = 162.0\text{ ms}$ almost surely on triggered turns and $T_{\textnormal{io}} \ge T_{\textnormal{io}}^{\min} = 160.0\text{ ms}$ on enterprise database RPCs, the overlap reduction satisfies $\min(T_{\textnormal{io}}, T_{\textnormal{lead}}) \ge \min(T_{\textnormal{lead}}^{\min}, T_{\textnormal{io}}^{\min})$ point-wise. By monotonicity of quantiles ($X \le Y - c \implies Q_{1-\delta}(X) \le Q_{1-\delta}(Y) - c$), subtracting the guaranteed overlap floor and adding $T_{\textnormal{splice}} = 2.1\,\mu\text{s}$ yields Eq.~\eqref{eq:tail_quantile_bound}. Furthermore, because upper-tail database stalls ($T_{\textnormal{io}} \in [400\text{ ms}, 550\text{ ms}]$ at $p_{99}$) strictly exceed the lead-time window $T_{\textnormal{lead}} \in [162\text{ ms}, 378\text{ ms}]$, $\min(T_{\textnormal{io}}, T_{\textnormal{lead}}) = T_{\textnormal{lead}}$ holds in the upper tail. In multi-tenant serving, the total observed $p_{99}$ reduction of $520.4\text{ ms}$ ($842.0\text{ ms} \to 321.6\text{ ms}$) decomposes into $\approx 340.4\text{ ms}$ of direct intra-turn decode-to-I/O overlap plus $\approx 180.0\text{ ms}$ of eliminated multi-tenant HBM page-allocation queue-wait compounding (Proposition~\ref{prop:hbm_residency}).
+On the speculative hit event, Eq.~\eqref{eq:piecewise_latency} gives $T_{\textnormal{synapse}} = T_{\textnormal{decode}} + T_{\textnormal{io}} - \min(T_{\textnormal{io}}, T_{\textnormal{lead}}) + T_{\textnormal{splice}} = T_{\textnormal{serial}} - \min(T_{\textnormal{io}}, T_{\textnormal{lead}}) + T_{\textnormal{splice}}$. Because $T_{\textnormal{lead}} \ge T_{\textnormal{lead}}^{\min} = 162.0\text{ ms}$ almost surely on triggered turns and $T_{\textnormal{io}} \ge T_{\textnormal{io}}^{\min} = 160.0\text{ ms}$ on enterprise database RPCs, the overlap reduction satisfies $\min(T_{\textnormal{io}}, T_{\textnormal{lead}}) \ge \min(T_{\textnormal{lead}}^{\min}, T_{\textnormal{io}}^{\min})$ point-wise. By monotonicity of quantiles ($X \le Y - c \implies Q_{1-\delta}(X) \le Q_{1-\delta}(Y) - c$), subtracting the guaranteed overlap floor and adding $T_{\textnormal{splice}} = 2.1\,\mu\text{s}$ yields Eq.~\eqref{eq:tail_quantile_bound}. Furthermore, because upper-tail database stalls ($T_{\textnormal{io}} \in [400\text{ ms}, 550\text{ ms}]$ at $p_{99}$) strictly exceed the lead-time window $T_{\textnormal{lead}} \in [162\text{ ms}, 378\text{ ms}]$, $\min(T_{\textnormal{io}}, T_{\textnormal{lead}}) = T_{\textnormal{lead}}$ holds in the upper tail. For the unconditional mixture distribution across all $N=750$ idempotent turns, because the hit branch dominates with probability $p_{\textnormal{trig}}\eta = 80.82\%$ and the mismatch branch incurs negligible microsecond rollback ($T_{\textnormal{rb}} < 12\,\mu\text{s}$), the upper tail latency is bounded by the hit and gated trajectories without penalty from speculative failures. In multi-tenant serving, the total observed $p_{99}$ reduction of $520.4\text{ ms}$ ($842.0\text{ ms} \to 321.6\text{ ms}$) decomposes into $\approx 340.4\text{ ms}$ of direct intra-turn decode-to-I/O overlap plus $\approx 180.0\text{ ms}$ of eliminated multi-tenant HBM page-allocation queue-wait compounding (Proposition~\ref{prop:hbm_residency}).
 \end{proof}
 
 \section{Cycle-Accurate SRAM Page-Table Rollback Model on Cloud TPU v6e and NVIDIA B200}
@@ -1059,7 +1072,7 @@ The cycle count $C_{\text{swap}}$ required to restore $\mathcal{P}_{\text{SRAM}}
 C_{\text{swap}}(N_{\text{pages}}) = C_{\text{fence}} + \left\lceil \frac{8 \cdot N_{\text{pages}}}{W_{\text{vec}}} \right\rceil \cdot C_{\text{sram\_rw}} + C_{\text{tlb\_inv}},
 \label{eq:sram_cycles}
 \end{equation}
-where $C_{\text{fence}} \in [120, 240]$ cycles is the pipeline synchronization barrier at $t_{\text{eos}}$, $C_{\text{sram\_rw}} \in [4, 8]$ cycles is the pipelined on-chip SRAM read-write latency per vector word, and $C_{\text{tlb\_inv}} \in [180, 350]$ cycles invalidates the $N_{\text{spec}}$ shadow entries in the local page-descriptor cache. Even for a long $32{,}768$-token context ($N_{\text{pages}} = 2{,}048$, descriptor size $16\text{ KB}$), $\lceil 16{,}384 / 512 \rceil = 32$ vector moves require $< 600$ clock cycles ($\approx 0.34\,\mu\text{s}$ of raw SRAM transfer), and adding Python/C++ runtime dispatch, SHA-256 AST digest comparison ($1.8\,\mu\text{s}$), and DMA descriptor synchronization yields a total measured $p_{50}$ of $3.8\,\mu\text{s}$ on TPU v6e and $4.4\,\mu\text{s}$ on B200 ($p_{99} \le 10.1\,\mu\text{s} < 12.0\,\mu\text{s}$).
+where $C_{\text{fence}} \in [120, 240]$ cycles is the pipeline synchronization barrier at $t_{\text{eos}}$, $C_{\text{sram\_rw}} \in [4, 8]$ cycles is the pipelined on-chip SRAM read-write latency per vector word, and $C_{\text{tlb\_inv}} \in [180, 350]$ cycles invalidates the $N_{\text{spec}}$ shadow entries in the local page-descriptor cache. Even for a long $32{,}768$-token context ($N_{\text{pages}} = 2{,}048$, descriptor size $16.0\text{ KiB}$), on TPU v6e $\lceil 16{,}384 / 512 \rceil = 32$ vector moves require $< 600$ clock cycles ($\approx 0.34\,\mu\text{s}$ of raw SRAM transfer), while on NVIDIA B200 $\lceil 16{,}384 / 128 \rceil = 128$ warp transactions yield $C_{\text{swap}}(2048) \in [812, 1614]$ cycles ($\approx 0.39$--$0.77\,\mu\text{s}$). Adding Python/C++ runtime dispatch, SHA-256 AST digest comparison ($1.8\,\mu\text{s}$), and DMA descriptor synchronization yields a total measured $p_{50}$ of $3.8\,\mu\text{s}$ on TPU v6e and $4.4\,\mu\text{s}$ on B200 ($p_{99} \le 10.1\,\mu\text{s} < 12.0\,\mu\text{s}$).
 
 \begin{table}[!t]
 \centering
@@ -1076,11 +1089,13 @@ where $C_{\text{fence}} \in [120, 240]$ cycles is the pipeline synchronization b
 2. Page-Table Pointer Restore & $1.4\,\mu\text{s}$ & $1.7\,\mu\text{s}$ & $420.0\,\mu\text{s}$ (HBM Evict) \\
 3. Shadow Frame Bitmap Free & $0.8\,\mu\text{s}$ & $0.9\,\mu\text{s}$ & $27{,}980.0\,\mu\text{s}$ (Attention) \\
 \midrule
-\textbf{Total Median ($p_{50}$)} & $\mathbf{3.8\,\mu\text{\textbf{s}}}$ & $\mathbf{4.4\,\mu\text{\textbf{s}}}$ & $28{,}401.8\,\mu\text{s}$ \\
+\textbf{Total Median ($p_{50}$)} & $\mathbf{3.8\,\mu\text{\textbf{s}}}$ & $\mathbf{4.4\,\mu\text{\textbf{s}}}$ & $28{,}401.8\,\mu\text{s}^\dagger$ \\
 \textbf{Total 99th Percentile ($p_{99}$)} & $\mathbf{9.4\,\mu\text{\textbf{s}}}$ & $\mathbf{10.1\,\mu\text{\textbf{s}}}$ & $44{,}100.0\,\mu\text{s}$ \\
 \bottomrule
 \end{tabular}%
 }
+\vspace*{1mm}
+{\scriptsize $^\dagger$In Table~\ref{tab:main_benchmark} (Panel~B) and Section~\ref{sec:eval}, the pooled median HBM Re-Prefill latency across Cloud TPU v6e ($26{,}900\,\mu\text{s}$) and NVIDIA B200 ($29{,}800\,\mu\text{s}$) is reported rounded to $28.4\text{ ms}$ ($28{,}400\,\mu\text{s}$).}
 \end{table}
 
 \section{Equivalence Classes and Boundary Conditions of Canonical AST Splicing}
@@ -1152,10 +1167,10 @@ T.~Dao, D.~Y. Fu, S.~Ermon, A.~Rudra, and C.~R{\'e}, ``{FlashAttention}: Fast an
 T.~Dao, ``{FlashAttention-2}: Faster attention with better parallelism and work partitioning,'' in \emph{Proc. International Conference on Learning Representations (ICLR)}, 2024.
 
 \bibitem{google2024trillium}
-{Google Cloud}, ``{Cloud TPU v6e (Trillium)} architecture and system specifications,'' Google Cloud Documentation, 2024. [Online]. Available: \url{https://cloud.google.com/tpu/docs/v6e}.
+{Google Cloud}, ``{TPU v6e} architecture,'' Google Cloud Documentation, 2024. [Online]. Available: \url{https://cloud.google.com/tpu/docs/v6e}.
 
 \bibitem{nvidia2024blackwell}
-{NVIDIA Corporation}, ``{NVIDIA Blackwell} architecture technical brief: Tensor Memory ({TMEM}) and 5th-generation Tensor Cores,'' NVIDIA Technical Whitepaper, 2024.
+{NVIDIA Corporation}, ``{NVIDIA Blackwell} architecture technical brief: Powering the new era of generative {AI} and accelerated computing,'' NVIDIA Technical Whitepaper, 2024.
 
 \bibitem{yao2023react}
 S.~Yao, J.~Zhao, D.~Yu, N.~Du, I.~Shafran, K.~Narasimhan, and Y.~Cao, ``{ReAct}: Synergizing reasoning and acting in language models,'' in \emph{Proc. International Conference on Learning Representations (ICLR)}, 2023.
@@ -1172,8 +1187,8 @@ S.~G. Patil, T.~Zhang, X.~Wang, and J.~E. Gonzalez, ``Gorilla: Large language mo
 \bibitem{kim2024llmcompiler}
 S.~Kim, S.~Moon, R.~Tabrizi, N.~Lee, M.~W. Mahoney, K.~Keutzer, and A.~Gholami, ``An {LLM} compiler for parallel function calling,'' in \emph{Proc. 41st International Conference on Machine Learning (ICML)}, 2024.
 
-\bibitem{zhang2025spectool}
-H.~Zhang, Y.~Wang, and L.~Chen, ``Speculative tool calling for accelerating autonomous language model agents,'' in \emph{Proc. Workshop on Efficient Systems for Foundation Models (ES-FoMo)}, 2025.
+\bibitem{ye2025speculative}
+N.~Ye, Z.~Wang, B.~Sun, Y.~Zheng, and H.~Zhang, ``Speculative actions: A lossless framework for faster agentic systems,'' \emph{arXiv preprint arXiv:2502.16852}, 2025.
 
 \bibitem{zheng2024sglang}
 L.~Zheng, L.~Yin, Z.~Xie, C.~Sun, J.~Huang, C.~H. Yu, S.~Cao, C.~Kozyrakis, I.~Stoica, J.~E. Gonzalez \emph{et~al.}, ``{SGLang}: Efficient execution of structured language model programs,'' \emph{arXiv preprint arXiv:2312.07104}, 2024.
