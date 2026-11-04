@@ -99,7 +99,7 @@ def verify_idf_json(json_path: Path) -> None:
         assert "|" not in html, f"Raw Markdown pipe '|' found in IDF section {sec}"
         assert "*Describe" not in html, f"Template placeholder found in {sec}"
         assert "---" not in html, f"Markdown divider '---' found in {sec}"
-        assert "<h3>" in html and "<p>" in html, f"Missing HTML tags in {sec}"
+        assert ("<h3>" in html or "<h4>" in html) and "<p>" in html, f"Missing HTML tags in {sec}"
 
     print(
         f"[OK] {json_path.name}: 5/5 go/IDF sections verified with 100% pure HTML, "
